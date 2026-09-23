@@ -1,0 +1,247 @@
+#pragma kernel KernelIntegrate
+#pragma kernel KernelSolveFEM
+#pragma kernel KernelApplyDeltas
+#pragma kernel KernelPostPhysics
+
+struct Tetrahedron
+{
+    int v0, v1, v2, v3;
+    float restVolume;
+    int active;
+};
+
+struct GPUMatrix3x3
+{
+    float m00, m01, m02;
+    float m10, m11, m12;
+    float m20, m21, m22;
+};
+
+// Buffers
+RWStructuredBuffer<float3> positionsBuffer;
+RWStructuredBuffer<float3> prevPositionsBuffer;
+RWStructuredBuffer<float3> velocitiesBuffer;
+StructuredBuffer<float> invMassesBuffer;
+
+StructuredBuffer<Tetrahedron> tetsBuffer;
+StructuredBuffer<GPUMatrix3x3> invRestMatricesBuffer;
+
+RWStructuredBuffer<int3> deltaPosIntBuffer;
+RWStructuredBuffer<int> deltaCountBuffer;
+
+// Parameters
+uint numVertices;
+uint numTets;
+float dt;
+float mu;
+float lambda;
+float damping;
+float3 gravity;
+float maxDisplacement;
+float floorY;
+int enableFloorCollision;
+
+#define SCALE_FACTOR 100000.0f
+
+// --- Helper Matrix Math Functions ---
+float3x3 ToFloat3x3(GPUMatrix3x3 m)
+{
+    return float3x3(
+        m.m00, m.m01, m.m02,
+        m.m10, m.m11, m.m12,
+        m.m20, m.m21, m.m22
+    );
+}
+
+float3x3 Inverse3x3(float3x3 m)
+{
+    float det = determinant(m);
+    if (abs(det) < 1e-7f)
+        return float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+    float invDet = 1.0f / det;
+    float3x3 r;
+    r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * invDet;
+    r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * invDet;
+    r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * invDet;
+
+    r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * invDet;
+    r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * invDet;
+    r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * invDet;
+
+    r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * invDet;
+    r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * invDet;
+    r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * invDet;
+    return r;
+}
+
+float3x3 ExtractRotation(float3x3 F)
+{
+    float3x3 R = F;
+    float det = determinant(R);
+    if (isnan(det) || abs(det) < 1e-6f)
+        return float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+
+    for (int iter = 0; iter < 5; iter++)
+    {
+        float3x3 invR = Inverse3x3(R);
+        float invDet = determinant(invR);
+        if (isnan(invDet) || abs(invDet) < 1e-6f)
+            break;
+
+        float3x3 invT = transpose(invR);
+        R = 0.5f * (R + invT);
+    }
+    return R;
+}
+
+void AtomicAddDelta(uint vIdx, float3 delta)
+{
+    int3 dInt = (int3) (delta * SCALE_FACTOR);
+    InterlockedAdd(deltaPosIntBuffer[vIdx].x, dInt.x);
+    InterlockedAdd(deltaPosIntBuffer[vIdx].y, dInt.y);
+    InterlockedAdd(deltaPosIntBuffer[vIdx].z, dInt.z);
+    InterlockedAdd(deltaCountBuffer[vIdx], 1);
+}
+
+// --- Kernels ---
+
+[numthreads(64, 1, 1)]
+void KernelIntegrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numVertices)
+        return;
+
+    if (invMassesBuffer[id.x] > 0.0f)
+    {
+        velocitiesBuffer[id.x] += gravity * dt;
+        velocitiesBuffer[id.x] *= (1.0f - damping);
+        prevPositionsBuffer[id.x] = positionsBuffer[id.x];
+        positionsBuffer[id.x] += velocitiesBuffer[id.x] * dt;
+    }
+
+    deltaPosIntBuffer[id.x] = int3(0, 0, 0);
+    deltaCountBuffer[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void KernelSolveFEM(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numTets)
+        return;
+
+    Tetrahedron tet = tetsBuffer[id.x];
+    if (tet.active == 0)
+        return;
+
+    float3 x0 = positionsBuffer[tet.v0];
+    float3 x1 = positionsBuffer[tet.v1];
+    float3 x2 = positionsBuffer[tet.v2];
+    float3 x3 = positionsBuffer[tet.v3];
+
+    float3 Ds0 = x1 - x0;
+    float3 Ds1 = x2 - x0;
+    float3 Ds2 = x3 - x0;
+
+    float3x3 Ds = float3x3(
+        Ds0.x, Ds1.x, Ds2.x,
+        Ds0.y, Ds1.y, Ds2.y,
+        Ds0.z, Ds1.z, Ds2.z
+    );
+
+    float3x3 invDm = ToFloat3x3(invRestMatricesBuffer[id.x]);
+    float vol0 = tet.restVolume;
+
+    // F = Ds * invDm
+    float3x3 F = mul(Ds, invDm);
+    float3x3 R = ExtractRotation(F);
+    float3x3 P = F - R;
+
+    float w0 = invMassesBuffer[tet.v0];
+    float w1 = invMassesBuffer[tet.v1];
+    float w2 = invMassesBuffer[tet.v2];
+    float w3 = invMassesBuffer[tet.v3];
+
+    // 1. Elastic Strain Correction
+    float3 d1 = float3(invDm[0][0], invDm[0][1], invDm[0][2]);
+    float3 d2 = float3(invDm[1][0], invDm[1][1], invDm[1][2]);
+    float3 d3 = float3(invDm[2][0], invDm[2][1], invDm[2][2]);
+
+    float3 f1_corr = mul(P, d1);
+    float3 f2_corr = mul(P, d2);
+    float3 f3_corr = mul(P, d3);
+    float3 f0_corr = -(f1_corr + f2_corr + f3_corr);
+
+    float stiffnessFactor = mu * vol0 * dt * dt;
+
+    AtomicAddDelta(tet.v0, -clamp(w0 * stiffnessFactor * f0_corr, -maxDisplacement, maxDisplacement));
+    AtomicAddDelta(tet.v1, -clamp(w1 * stiffnessFactor * f1_corr, -maxDisplacement, maxDisplacement));
+    AtomicAddDelta(tet.v2, -clamp(w2 * stiffnessFactor * f2_corr, -maxDisplacement, maxDisplacement));
+    AtomicAddDelta(tet.v3, -clamp(w3 * stiffnessFactor * f3_corr, -maxDisplacement, maxDisplacement));
+
+    // 2. Volume Compression Constraint
+    float detF = determinant(F);
+    if (!isnan(detF))
+    {
+        float C_vol = detF - 1.0f;
+        float3 col0 = float3(F[0][0], F[1][0], F[2][0]);
+        float3 col1 = float3(F[0][1], F[1][1], F[2][1]);
+        float3 col2 = float3(F[0][2], F[1][2], F[2][2]);
+
+        float3 cross12 = cross(col1, col2);
+        float3 cross20 = cross(col2, col0);
+        float3 cross01 = cross(col0, col1);
+
+        float3 g1_v = cross12 * invDm[0][0] + cross20 * invDm[0][1] + cross01 * invDm[0][2];
+        float3 g2_v = cross12 * invDm[1][0] + cross20 * invDm[1][1] + cross01 * invDm[1][2];
+        float3 g3_v = cross12 * invDm[2][0] + cross20 * invDm[2][1] + cross01 * invDm[2][2];
+        float3 g0_v = -(g1_v + g2_v + g3_v);
+
+        float sumGradSq_v = w0 * dot(g0_v, g0_v) + w1 * dot(g1_v, g1_v) + w2 * dot(g2_v, g2_v) + w3 * dot(g3_v, g3_v);
+        float alphaVol = 1.0f / (lambda * vol0 * dt * dt);
+
+        if (sumGradSq_v + alphaVol > 1e-7f)
+        {
+            float deltaLambda_v = -C_vol / (sumGradSq_v + alphaVol);
+
+            AtomicAddDelta(tet.v0, clamp(w0 * deltaLambda_v * g0_v, -maxDisplacement, maxDisplacement));
+            AtomicAddDelta(tet.v1, clamp(w1 * deltaLambda_v * g1_v, -maxDisplacement, maxDisplacement));
+            AtomicAddDelta(tet.v2, clamp(w2 * deltaLambda_v * g2_v, -maxDisplacement, maxDisplacement));
+            AtomicAddDelta(tet.v3, clamp(w3 * deltaLambda_v * g3_v, -maxDisplacement, maxDisplacement));
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void KernelApplyDeltas(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numVertices)
+        return;
+
+    int count = deltaCountBuffer[id.x];
+    if (count > 0)
+    {
+        float3 avgDelta = ((float3) deltaPosIntBuffer[id.x] / SCALE_FACTOR) / (float) count;
+        positionsBuffer[id.x] += avgDelta;
+    }
+
+    deltaPosIntBuffer[id.x] = int3(0, 0, 0);
+    deltaCountBuffer[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void KernelPostPhysics(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numVertices)
+        return;
+
+    if (enableFloorCollision == 1 && positionsBuffer[id.x].y < floorY)
+    {
+        positionsBuffer[id.x].y = floorY;
+        velocitiesBuffer[id.x].y = 0.0f;
+    }
+
+    if (invMassesBuffer[id.x] > 0.0f)
+    {
+        velocitiesBuffer[id.x] = (positionsBuffer[id.x] - prevPositionsBuffer[id.x]) / dt;
+    }
+}
