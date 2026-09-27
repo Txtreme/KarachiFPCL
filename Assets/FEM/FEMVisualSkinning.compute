@@ -2,35 +2,133 @@
 
 struct GPUTet
 {
-    int v0;
-    int v1;
-    int v2;
-    int v3;
+    int v0, v1, v2, v3;
 };
 
 StructuredBuffer<GPUTet> _TetBuffer;
 StructuredBuffer<float3> _PhysPosBuffer;
+StructuredBuffer<float3> _RestPosBuffer;
 StructuredBuffer<int> _CustomTetIndices;
 StructuredBuffer<float4> _CustomBaryWeights;
-RWStructuredBuffer<float3> _DeformedVertices;
+StructuredBuffer<float3> _CustomSourceNormals;
 
-int numVertices;
+RWStructuredBuffer<float3> _DeformedVertices;
+RWStructuredBuffer<float3> _DeformedNormals;
+
+uint numVertices;
+
+bool IsNaN(float3 v)
+{
+    return isnan(v.x) || isnan(v.y) || isnan(v.z) || isinf(v.x) || isinf(v.y) || isinf(v.z);
+}
 
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
-    uint idx = id.x;
-    if (idx >= (uint) numVertices)
+    uint vIdx = id.x;
+    if (vIdx >= numVertices)
         return;
 
-    int tetIdx = _CustomTetIndices[idx];
+    int tetIdx = _CustomTetIndices[vIdx];
+    float4 w = _CustomBaryWeights[vIdx];
     GPUTet tet = _TetBuffer[tetIdx];
-    float4 w = _CustomBaryWeights[idx];
 
-    float3 p0 = _PhysPosBuffer[tet.v0];
-    float3 p1 = _PhysPosBuffer[tet.v1];
-    float3 p2 = _PhysPosBuffer[tet.v2];
-    float3 p3 = _PhysPosBuffer[tet.v3];
+    // Current (deformed) physical positions
+    float3 x0 = _PhysPosBuffer[tet.v0];
+    float3 x1 = _PhysPosBuffer[tet.v1];
+    float3 x2 = _PhysPosBuffer[tet.v2];
+    float3 x3 = _PhysPosBuffer[tet.v3];
 
-    _DeformedVertices[idx] = p0 * w.x + p1 * w.y + p2 * w.z + p3 * w.w;
+    // Rest positions
+    float3 X0 = _RestPosBuffer[tet.v0];
+    float3 X1 = _RestPosBuffer[tet.v1];
+    float3 X2 = _RestPosBuffer[tet.v2];
+    float3 X3 = _RestPosBuffer[tet.v3];
+
+    float3 deformedPos = x0 * w.x + x1 * w.y + x2 * w.z + x3 * w.w;
+
+    // Fall back to rest position if NaN or Infinity is detected
+    if (IsNaN(deformedPos))
+    {
+        deformedPos = X0 * w.x + X1 * w.y + X2 * w.z + X3 * w.w;
+    }
+
+    _DeformedVertices[vIdx] = deformedPos;
+
+    // Normal Transformation via Deformation Gradient Inverse Transpose
+    float3 N_rest = _CustomSourceNormals[vIdx];
+
+    float3 dm0 = X1 - X0;
+    float3 dm1 = X2 - X0;
+    float3 dm2 = X3 - X0;
+
+    float3 ds0 = x1 - x0;
+    float3 ds1 = x2 - x0;
+    float3 ds2 = x3 - x0;
+
+    float3 v = float3(dot(dm0, N_rest), dot(dm1, N_rest), dot(dm2, N_rest));
+    float detDs = dot(ds0, cross(ds1, ds2));
+
+    float3 defNormal = N_rest;
+    bool validNormal = false;
+
+    if (abs(detDs) > 1e-7f)
+    {
+        float invDet = 1.0f / detDs;
+        float3 us0 = cross(ds1, ds2) * invDet;
+        float3 us1 = cross(ds2, ds0) * invDet;
+        float3 us2 = cross(ds0, ds1) * invDet;
+
+        float3 normCandidate = v.x * us0 + v.y * us1 + v.z * us2;
+        float lenSq = dot(normCandidate, normCandidate);
+
+        if (lenSq > 1e-8f)
+        {
+            defNormal = normCandidate * rsqrt(lenSq);
+            validNormal = true;
+        }
+    }
+
+    // Fallback if inverse transpose fails (e.g. collapsed/flat element)
+    if (!validNormal)
+    {
+        float3x3 Dm = float3x3(dm0.x, dm1.x, dm2.x,
+                               dm0.y, dm1.y, dm2.y,
+                               dm0.z, dm1.z, dm2.z);
+        float detDm = determinant(Dm);
+        if (abs(detDm) > 1e-7f)
+        {
+            float invDetM = 1.0f / detDm;
+            float3x3 invDm;
+            invDm[0][0] = (Dm[1][1] * Dm[2][2] - Dm[1][2] * Dm[2][1]) * invDetM;
+            invDm[0][1] = (Dm[0][2] * Dm[2][1] - Dm[0][1] * Dm[2][2]) * invDetM;
+            invDm[0][2] = (Dm[0][1] * Dm[1][2] - Dm[0][2] * Dm[1][1]) * invDetM;
+
+            invDm[1][0] = (Dm[1][2] * Dm[2][0] - Dm[1][0] * Dm[2][2]) * invDetM;
+            invDm[1][1] = (Dm[0][0] * Dm[2][2] - Dm[0][2] * Dm[2][0]) * invDetM;
+            invDm[1][2] = (Dm[0][2] * Dm[1][0] - Dm[0][0] * Dm[1][2]) * invDetM;
+
+            invDm[2][0] = (Dm[1][0] * Dm[2][1] - Dm[1][1] * Dm[2][0]) * invDetM;
+            invDm[2][1] = (Dm[0][1] * Dm[2][0] - Dm[0][0] * Dm[2][1]) * invDetM;
+            invDm[2][2] = (Dm[0][0] * Dm[1][1] - Dm[0][1] * Dm[1][0]) * invDetM;
+
+            float3x3 Ds = float3x3(ds0.x, ds1.x, ds2.x,
+                                   ds0.y, ds1.y, ds2.y,
+                                   ds0.z, ds1.z, ds2.z);
+            float3x3 F = mul(Ds, invDm);
+            float3 forwardNorm = mul(F, N_rest);
+            float lenSqF = dot(forwardNorm, forwardNorm);
+            if (lenSqF > 1e-8f)
+            {
+                defNormal = forwardNorm * rsqrt(lenSqF);
+            }
+        }
+    }
+
+    if (IsNaN(defNormal))
+    {
+        defNormal = N_rest;
+    }
+
+    _DeformedNormals[vIdx] = defNormal;
 }

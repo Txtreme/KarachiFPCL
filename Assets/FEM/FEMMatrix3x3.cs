@@ -40,7 +40,9 @@ public struct FEMMatrix3x3
     public FEMMatrix3x3 Inverse()
     {
         float det = Determinant();
-        if (Mathf.Abs(det) < 1e-7f) return Identity;
+        // Increase epsilon and clamp determinant sign to prevent division explosion
+        if (Mathf.Abs(det) < 1e-6f)
+            det = Mathf.Sign(det) * 1e-6f;
 
         float invDet = 1.0f / det;
         return new FEMMatrix3x3(
@@ -57,7 +59,6 @@ public struct FEMMatrix3x3
             (m00 * m11 - m01 * m10) * invDet
         );
     }
-
     public Vector3 MultiplyVector(Vector3 v)
     {
         return new Vector3(

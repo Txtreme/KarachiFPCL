@@ -7,6 +7,7 @@ public struct Tetrahedron
     public int v0, v1, v2, v3;
     public float restVolume;
     public bool active;
+    public int materialId;
 
     public Tetrahedron(int v0, int v1, int v2, int v3)
     {
@@ -16,6 +17,7 @@ public struct Tetrahedron
         this.v3 = v3;
         this.restVolume = 0f;
         this.active = true;
+        this.materialId = 0;
     }
 }
 
@@ -32,6 +34,9 @@ public class TetrahedralMesh
         Vector3[] origVerts = mesh.vertices;
         int[] origTris = mesh.triangles;
         if (origVerts.Length == 0 || origTris.Length == 0) return tetMesh;
+
+        // Spatial acceleration wrapper for fast point testing & projection
+        MeshSpatialAccelerator accelerator = new MeshSpatialAccelerator(origVerts, origTris);
 
         Bounds bounds = mesh.bounds;
         bounds.Expand(0.01f);
@@ -118,11 +123,11 @@ public class TetrahedralMesh
 
                         Vector3 centroid = (p0 + p1 + p2 + p3) * 0.25f;
 
-                        if (IsPointInsideMesh(centroid, origVerts, origTris) ||
-                            IsPointInsideMesh(p0, origVerts, origTris) ||
-                            IsPointInsideMesh(p1, origVerts, origTris) ||
-                            IsPointInsideMesh(p2, origVerts, origTris) ||
-                            IsPointInsideMesh(p3, origVerts, origTris))
+                        if (accelerator.IsPointInsideMesh(centroid) ||
+                            accelerator.IsPointInsideMesh(p0) ||
+                            accelerator.IsPointInsideMesh(p1) ||
+                            accelerator.IsPointInsideMesh(p2) ||
+                            accelerator.IsPointInsideMesh(p3))
                         {
                             int i0 = GetOrAddVertex(tetPattern[0]);
                             int i1 = GetOrAddVertex(tetPattern[1]);
@@ -144,122 +149,196 @@ public class TetrahedralMesh
 
         foreach (int vIdx in surfaceVertIndices)
         {
-            tetMesh.vertices[vIdx] = GetClosestPointOnMesh(tetMesh.vertices[vIdx], origVerts, origTris);
+            tetMesh.vertices[vIdx] = accelerator.GetClosestPointOnMesh(tetMesh.vertices[vIdx]);
         }
 
         return tetMesh;
     }
 
-    private static bool IsPointInsideMesh(Vector3 point, Vector3[] verts, int[] tris)
-    {
-        Vector3 rayDir = new Vector3(0.408248f, 0.816497f, 0.408248f);
-        int intersections = 0;
-
-        for (int i = 0; i < tris.Length; i += 3)
-        {
-            Vector3 v0 = verts[tris[i]];
-            Vector3 v1 = verts[tris[i + 1]];
-            Vector3 v2 = verts[tris[i + 2]];
-
-            if (RayTriangleIntersection(point, rayDir, v0, v1, v2))
-            {
-                intersections++;
-            }
-        }
-
-        return (intersections % 2) == 1;
-    }
-
-    private static bool RayTriangleIntersection(Vector3 rayOrigin, Vector3 rayDir, Vector3 v0, Vector3 v1, Vector3 v2)
-    {
-        const float EPSILON = 1e-7f;
-        Vector3 edge1 = v1 - v0;
-        Vector3 edge2 = v2 - v0;
-        Vector3 h = Vector3.Cross(rayDir, edge2);
-        float a = Vector3.Dot(edge1, h);
-
-        if (a > -EPSILON && a < EPSILON) return false;
-
-        float f = 1.0f / a;
-        Vector3 s = rayOrigin - v0;
-        float u = f * Vector3.Dot(s, h);
-
-        if (u < 0.0f || u > 1.0f) return false;
-
-        Vector3 q = Vector3.Cross(s, edge1);
-        float v = f * Vector3.Dot(rayDir, q);
-
-        if (v < 0.0f || u + v > 1.0f) return false;
-
-        float t = f * Vector3.Dot(edge2, q);
-        return t > EPSILON;
-    }
-
     // =========================================================================
-    // HELPER FUNCTIONS: Surface Projection Logic
+    // SPATIAL ACCELERATOR CLASS
     // =========================================================================
-    private static Vector3 GetClosestPointOnMesh(Vector3 point, Vector3[] verts, int[] tris)
+    private class MeshSpatialAccelerator
     {
-        float minSqDist = float.MaxValue;
-        Vector3 closestPoint = point;
-
-        for (int i = 0; i < tris.Length; i += 3)
+        private struct TriangleData
         {
-            Vector3 p = ClosestPointOnTriangle(point, verts[tris[i]], verts[tris[i + 1]], verts[tris[i + 2]]);
-            float sqDist = (point - p).sqrMagnitude;
-            if (sqDist < minSqDist)
+            public Vector3 v0, v1, v2;
+            public Bounds bounds;
+        }
+
+        private readonly TriangleData[] triangles;
+        private readonly Bounds totalBounds;
+
+        public MeshSpatialAccelerator(Vector3[] verts, int[] tris)
+        {
+            int triCount = tris.Length / 3;
+            triangles = new TriangleData[triCount];
+
+            if (verts.Length > 0)
             {
-                minSqDist = sqDist;
-                closestPoint = p;
+                totalBounds = new Bounds(verts[0], Vector3.zero);
             }
+
+            for (int i = 0; i < triCount; i++)
+            {
+                Vector3 v0 = verts[tris[i * 3]];
+                Vector3 v1 = verts[tris[i * 3 + 1]];
+                Vector3 v2 = verts[tris[i * 3 + 2]];
+
+                triangles[i].v0 = v0;
+                triangles[i].v1 = v1;
+                triangles[i].v2 = v2;
+
+                Bounds b = new Bounds(v0, Vector3.zero);
+                b.Encapsulate(v1);
+                b.Encapsulate(v2);
+                triangles[i].bounds = b;
+
+                totalBounds.Encapsulate(b);
+            }
+
+            totalBounds.Expand(0.02f);
         }
-        return closestPoint;
-    }
 
-    private static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
-    {
-        Vector3 ab = b - a;
-        Vector3 ac = c - a;
-        Vector3 ap = p - a;
-        float d1 = Vector3.Dot(ab, ap);
-        float d2 = Vector3.Dot(ac, ap);
-        if (d1 <= 0.0f && d2 <= 0.0f) return a;
-
-        Vector3 bp = p - b;
-        float d3 = Vector3.Dot(ab, bp);
-        float d4 = Vector3.Dot(ac, bp);
-        if (d3 >= 0.0f && d4 <= d3) return b;
-
-        float vc = d1 * d4 - d3 * d2;
-        if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+        public bool IsPointInsideMesh(Vector3 point)
         {
-            float v = d1 / (d1 - d3);
-            return a + v * ab;
+            if (!totalBounds.Contains(point)) return false;
+
+            Vector3 rayDir = new Vector3(0.408248f, 0.816497f, 0.408248f);
+            int intersections = 0;
+
+            for (int i = 0; i < triangles.Length; i++)
+            {
+                if (RayIntersectsAABB(point, rayDir, triangles[i].bounds))
+                {
+                    if (RayTriangleIntersection(point, rayDir, triangles[i].v0, triangles[i].v1, triangles[i].v2))
+                    {
+                        intersections++;
+                    }
+                }
+            }
+
+            return (intersections % 2) == 1;
         }
 
-        Vector3 cp = p - c;
-        float d5 = Vector3.Dot(ab, cp);
-        float d6 = Vector3.Dot(ac, cp);
-        if (d6 >= 0.0f && d5 <= d6) return c;
-
-        float vb = d5 * d2 - d1 * d6;
-        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+        public Vector3 GetClosestPointOnMesh(Vector3 point)
         {
-            float w = d2 / (d2 - d6);
-            return a + w * ac;
+            float minSqDist = float.MaxValue;
+            Vector3 closestPoint = point;
+
+            for (int i = 0; i < triangles.Length; i++)
+            {
+                float sqDistToBounds = triangles[i].bounds.SqrDistance(point);
+                if (sqDistToBounds >= minSqDist) continue;
+
+                Vector3 p = ClosestPointOnTriangle(point, triangles[i].v0, triangles[i].v1, triangles[i].v2);
+                float sqDist = (point - p).sqrMagnitude;
+                if (sqDist < minSqDist)
+                {
+                    minSqDist = sqDist;
+                    closestPoint = p;
+                }
+            }
+            return closestPoint;
         }
 
-        float va = d3 * d6 - d5 * d4;
-        if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+        private static bool RayIntersectsAABB(Vector3 origin, Vector3 dir, Bounds bounds)
         {
-            float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-            return b + w * (c - b);
+            Vector3 min = bounds.min;
+            Vector3 max = bounds.max;
+
+            float tmin = (min.x - origin.x) / dir.x;
+            float tmax = (max.x - origin.x) / dir.x;
+            if (tmin > tmax) { float tmp = tmin; tmin = tmax; tmax = tmp; }
+
+            float tymin = (min.y - origin.y) / dir.y;
+            float tymax = (max.y - origin.y) / dir.y;
+            if (tymin > tymax) { float tmp = tymin; tymin = tymax; tymax = tmp; }
+
+            if ((tmin > tymax) || (tymin > tmax)) return false;
+            if (tymin > tmin) tmin = tymin;
+            if (tymax < tmax) tmax = tymax;
+
+            float tzmin = (min.z - origin.z) / dir.z;
+            float tzmax = (max.z - origin.z) / dir.z;
+            if (tzmin > tzmax) { float tmp = tzmin; tzmin = tzmax; tzmax = tmp; }
+
+            if ((tmin > tzmax) || (tzmin > tmax)) return false;
+            if (tzmax < tmax) tmax = tzmax;
+
+            return tmax >= 0f;
         }
 
-        float denom = 1.0f / (va + vb + vc);
-        float v_ = vb * denom;
-        float w_ = vc * denom;
-        return a + ab * v_ + ac * w_;
+        private static bool RayTriangleIntersection(Vector3 rayOrigin, Vector3 rayDir, Vector3 v0, Vector3 v1, Vector3 v2)
+        {
+            const float EPSILON = 1e-7f;
+            Vector3 edge1 = v1 - v0;
+            Vector3 edge2 = v2 - v0;
+            Vector3 h = Vector3.Cross(rayDir, edge2);
+            float a = Vector3.Dot(edge1, h);
+
+            if (a > -EPSILON && a < EPSILON) return false;
+
+            float f = 1.0f / a;
+            Vector3 s = rayOrigin - v0;
+            float u = f * Vector3.Dot(s, h);
+
+            if (u < 0.0f || u > 1.0f) return false;
+
+            Vector3 q = Vector3.Cross(s, edge1);
+            float v = f * Vector3.Dot(rayDir, q);
+
+            if (v < 0.0f || u + v > 1.0f) return false;
+
+            float t = f * Vector3.Dot(edge2, q);
+            return t > EPSILON;
+        }
+
+        private static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
+        {
+            Vector3 ab = b - a;
+            Vector3 ac = c - a;
+            Vector3 ap = p - a;
+            float d1 = Vector3.Dot(ab, ap);
+            float d2 = Vector3.Dot(ac, ap);
+            if (d1 <= 0.0f && d2 <= 0.0f) return a;
+
+            Vector3 bp = p - b;
+            float d3 = Vector3.Dot(ab, bp);
+            float d4 = Vector3.Dot(ac, bp);
+            if (d3 >= 0.0f && d4 <= d3) return b;
+
+            float vc = d1 * d4 - d3 * d2;
+            if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+            {
+                float v = d1 / (d1 - d3);
+                return a + v * ab;
+            }
+
+            Vector3 cp = p - c;
+            float d5 = Vector3.Dot(ab, cp);
+            float d6 = Vector3.Dot(ac, cp);
+            if (d6 >= 0.0f && d5 <= d6) return c;
+
+            float vb = d5 * d2 - d1 * d6;
+            if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+            {
+                float w = d2 / (d2 - d6);
+                return a + w * ac;
+            }
+
+            float va = d3 * d6 - d5 * d4;
+            if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+            {
+                float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                return b + w * (c - b);
+            }
+
+            float denom = 1.0f / (va + vb + vc);
+            float v_ = vb * denom;
+            float w_ = vc * denom;
+            return a + ab * v_ + ac * w_;
+        }
     }
 
     public List<int> ReconstructSurfaceTriangles()

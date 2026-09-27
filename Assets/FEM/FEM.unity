@@ -133,8 +133,9 @@ GameObject:
   - component: {fileID: 177101811}
   - component: {fileID: 177101810}
   - component: {fileID: 177101809}
-  - component: {fileID: 177101807}
   - component: {fileID: 177101812}
+  - component: {fileID: 177101813}
+  - component: {fileID: 177101807}
   m_Layer: 0
   m_Name: Cube
   m_TagString: Untagged
@@ -154,12 +155,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 88e76976eb8a2b845af51e0e3e9169e2, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  cutMode: 2
-  cutOnTrigger: 1
+  cutMode: 0
+  cutOnTrigger: 0
   bladeThicknessMargin: 0.05
   cutRadius: 0.5
-  targetBoxCollider: {fileID: 0}
-  targetMeshCollider: {fileID: 177101812}
+  targetBoxCollider: {fileID: 177101812}
+  targetMeshCollider: {fileID: 0}
 --- !u!23 &177101809
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -219,14 +220,14 @@ Transform:
   m_GameObject: {fileID: 177101806}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 4.525, y: 1.807, z: -2.261}
-  m_LocalScale: {x: 1, y: 1, z: 0.017400056}
+  m_LocalPosition: {x: 2.22, y: 2.56, z: -2.261}
+  m_LocalScale: {x: 1.786, y: 0.8831964, z: 0.017400056}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!64 &177101812
-MeshCollider:
+--- !u!65 &177101812
+BoxCollider:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
@@ -240,13 +241,39 @@ MeshCollider:
     serializedVersion: 2
     m_Bits: 0
   m_LayerOverridePriority: 0
-  m_IsTrigger: 0
+  m_IsTrigger: 1
   m_ProvidesContacts: 0
   m_Enabled: 1
-  serializedVersion: 5
-  m_Convex: 0
-  m_CookingOptions: 30
-  m_Mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
+  serializedVersion: 3
+  m_Size: {x: 1, y: 1, z: 1}
+  m_Center: {x: 0, y: 0, z: 0}
+--- !u!54 &177101813
+Rigidbody:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 177101806}
+  serializedVersion: 4
+  m_Mass: 1
+  m_Drag: 0
+  m_AngularDrag: 0.05
+  m_CenterOfMass: {x: 0, y: 0, z: 0}
+  m_InertiaTensor: {x: 1, y: 1, z: 1}
+  m_InertiaRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_IncludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ExcludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ImplicitCom: 1
+  m_ImplicitTensor: 1
+  m_UseGravity: 1
+  m_IsKinematic: 1
+  m_Interpolate: 0
+  m_Constraints: 0
+  m_CollisionDetection: 0
 --- !u!1 &287044199
 GameObject:
   m_ObjectHideFlags: 0
@@ -397,19 +424,20 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a978afda96c693948b93b0d8b9231a40, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  sourceMesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
+  sourceMesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
   femComputeShader: {fileID: 7200000, guid: 92b27b25fafd4604b8bee6d8271b9bb2, type: 3}
-  targetTetSize: 0.1
+  targetTetSize: 0.08
   gridResolution: {x: 8, y: 8, z: 8}
   solverSubsteps: 10
+  solverIterations: 2
   particleMass: 0.1
   gravity: {x: 0, y: -9.81, z: 0}
   damping: 0.02
-  youngsModulus: 100000
+  youngsModulus: 50000
   poissonsRatio: 0.45
   enableFloorCollision: 1
   floorY: 0
-  drawTetWireframe: 0
+  drawTetWireframe: 1
 --- !u!23 &907848978
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -459,7 +487,7 @@ MeshFilter:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 907848975}
-  m_Mesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
+  m_Mesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!4 &907848980
 Transform:
   m_ObjectHideFlags: 0
@@ -469,7 +497,7 @@ Transform:
   m_GameObject: {fileID: 907848975}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 6.222498, y: 1.5812558, z: -2.161963}
+  m_LocalPosition: {x: 6.222498, y: 4.35, z: -2.161963}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -490,7 +518,7 @@ MonoBehaviour:
   skinningComputeShader: {fileID: 7200000, guid: 95b824bca871b53429e194ba66491220, type: 3}
   physicsBody: {fileID: 907848976}
   shellMode: 0
-  customVisualMesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
+  customVisualMesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!1 &1000514210
 GameObject:
   m_ObjectHideFlags: 0

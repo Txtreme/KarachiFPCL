@@ -1,11 +1,14 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using UnityEngine;
-using static TetrahedralMesh;
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class FEMPhysicsBody : MonoBehaviour
 {
+    // Active bodies registry for GPU Inter-Body Collisions
+    private static readonly List<FEMPhysicsBody> allActiveBodies = new List<FEMPhysicsBody>();
+
     [Header("Source Mesh Configuration")]
     [Tooltip("Assign the source 3D volume mesh (e.g. Sphere, Cube, FBX). If left empty, auto-detects from MeshFilter on Awake.")]
     public Mesh sourceMesh;
@@ -18,11 +21,14 @@ public class FEMPhysicsBody : MonoBehaviour
     public Vector3Int gridResolution = new Vector3Int(8, 8, 8);
 
     [Header("FEM Physical Parameters")]
-    [Range(1, 30)] public int solverSubsteps = 10;
+    [Range(1, 30)] public int solverSubsteps = 5;
+    [Range(1, 10)] public int solverIterations = 2;
     public float particleMass = 0.1f;
     public Vector3 gravity = new Vector3(0, -9.81f, 0);
     [Range(0f, 1f)] public float damping = 0.02f;
-
+    [Header("Self Collision")]
+    public bool enableSelfCollision = true;
+    public float particleRadius = 0.025f;
     [Header("Material Elasticity")]
     public float youngsModulus = 5000f;
     [Range(0.0f, 0.49f)] public float poissonsRatio = 0.45f;
@@ -38,8 +44,16 @@ public class FEMPhysicsBody : MonoBehaviour
     private Vector3[] prevPositions;
     private Vector3[] velocities;
     private float[] invMasses;
+    private Vector3[] restPositions;
+    private Vector3[] localVertsCache;
+    private int[] cachedSurfaceTriangles;
+
+    public TetrahedralMesh TetMesh => tetMesh;
+    public Vector3[] CurrentPositions => positions;
+    public Vector3[] RestPositions => restPositions;
 
     private GPUMatrix3x3[] invRestMatrices;
+    public Vector3[] Velocities => velocities;
 
     // GPU Compute Buffers
     private ComputeBuffer positionsBuffer;
@@ -51,8 +65,15 @@ public class FEMPhysicsBody : MonoBehaviour
     private ComputeBuffer deltaPosIntBuffer;
     private ComputeBuffer deltaCountBuffer;
 
-    private int kIntegrate, kSolveFEM, kApplyDeltas, kPostPhysics;
+    public ComputeBuffer PositionsBuffer => positionsBuffer;
 
+    private int kIntegrate, kSolveFEM, kApplyDeltas, kPostPhysics, kParticleCollisions, kInterBodyCollisions;
+
+    private bool isInitialized = false;
+    private FEMVisualShell cachedVisualShell;
+    private Mesh generatedColliderMesh;
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct GPUTetrahedron
     {
         public int v0, v1, v2, v3;
@@ -61,6 +82,7 @@ public class FEMPhysicsBody : MonoBehaviour
     }
 
     [System.Serializable]
+    [StructLayout(LayoutKind.Sequential)]
     public struct GPUMatrix3x3
     {
         public float m00, m01, m02;
@@ -68,19 +90,17 @@ public class FEMPhysicsBody : MonoBehaviour
         public float m20, m21, m22;
     }
 
-    public TetrahedralMesh TetMesh => tetMesh;
-    public Vector3[] CurrentPositions => positions;
-
     private void Awake()
     {
         EnsureComponentsExist();
+        cachedVisualShell = GetComponent<FEMVisualShell>();
 
         if (sourceMesh == null)
         {
             MeshFilter mf = GetComponent<MeshFilter>();
             if (mf != null && mf.sharedMesh != null)
             {
-                if (!mf.sharedMesh.name.Contains("FEM_Visual_Shell"))
+                if (!mf.sharedMesh.name.Contains("FEM_Visual_Shell") && !mf.sharedMesh.name.Contains("FEM_VisualMesh"))
                 {
                     sourceMesh = mf.sharedMesh;
                 }
@@ -90,6 +110,8 @@ public class FEMPhysicsBody : MonoBehaviour
 
     private void Start()
     {
+        if (isInitialized) return;
+
         if (tetMesh == null)
         {
             if (sourceMesh == null)
@@ -100,7 +122,7 @@ public class FEMPhysicsBody : MonoBehaviour
 
             if (!sourceMesh.isReadable)
             {
-                Debug.LogError($"FEMPhysicsBody: Mesh '{sourceMesh.name}' is not Read/Write enabled! Enable 'Read/Write' in model import settings.");
+                Debug.LogError($"FEMPhysicsBody: Mesh '{sourceMesh.name}' is not Read/Write enabled!");
                 return;
             }
 
@@ -125,11 +147,27 @@ public class FEMPhysicsBody : MonoBehaviour
 
         if (tetMesh == null || tetMesh.vertices == null || tetMesh.vertices.Count == 0 || tetMesh.tets == null || tetMesh.tets.Count == 0)
         {
-            Debug.LogError("FEMPhysicsBody: Tetrahedral generation returned 0 elements. Try lowering 'targetTetSize' or increasing 'gridResolution'.");
+            Debug.LogError("FEMPhysicsBody: Tetrahedral generation returned 0 elements.");
             return;
         }
 
         InitializePhysicsState();
+    }
+
+    private void OnEnable()
+    {
+        MeshCutter.RegisterBody(this);
+        if (!allActiveBodies.Contains(this))
+        {
+            allActiveBodies.Add(this);
+        }
+    }
+
+    private void OnDisable()
+    {
+        MeshCutter.UnregisterBody(this);
+        allActiveBodies.Remove(this);
+        ReleaseGPUResources();
     }
 
     private void EnsureComponentsExist()
@@ -137,15 +175,20 @@ public class FEMPhysicsBody : MonoBehaviour
         if (GetComponent<MeshFilter>() == null) gameObject.AddComponent<MeshFilter>();
     }
 
-    public void InitializePhysicsState(List<Vector3> customWorldPositions = null)
+    public void InitializePhysicsState(List<Vector3> customWorldPositions = null, List<Vector3> customRestPositions = null)
     {
         EnsureComponentsExist();
+        cachedVisualShell = GetComponent<FEMVisualShell>();
+
+        if (tetMesh == null || tetMesh.vertices == null) return;
 
         int n = tetMesh.vertices.Count;
         positions = new Vector3[n];
+        restPositions = new Vector3[n];
         prevPositions = new Vector3[n];
         velocities = new Vector3[n];
         invMasses = new float[n];
+        localVertsCache = new Vector3[n];
 
         for (int i = 0; i < n; i++)
         {
@@ -153,73 +196,113 @@ public class FEMPhysicsBody : MonoBehaviour
                 ? customWorldPositions[i]
                 : transform.TransformPoint(tetMesh.vertices[i]);
 
+            restPositions[i] = (customRestPositions != null && i < customRestPositions.Count)
+                ? customRestPositions[i]
+                : transform.TransformPoint(tetMesh.vertices[i]);
+
             prevPositions[i] = positions[i];
             velocities[i] = Vector3.zero;
-            invMasses[i] = 1.0f / particleMass;
+            invMasses[i] = 1.0f / Mathf.Max(0.0001f, particleMass);
         }
 
         PrecomputeRestMatrices();
         InitializeGPUResources();
 
-        if (GetComponent<FEMVisualShell>() == null)
+        cachedSurfaceTriangles = tetMesh.ReconstructSurfaceTriangles().ToArray();
+
+        MeshFilter mf = GetComponent<MeshFilter>();
+        if (cachedVisualShell == null && mf != null)
         {
-            Mesh visualMesh = new Mesh();
-            visualMesh.MarkDynamic();
-            GetComponent<MeshFilter>().mesh = visualMesh;
-            UpdateVisualMesh();
+            if (mf.sharedMesh == null || mf.sharedMesh == sourceMesh || !mf.sharedMesh.name.Contains("FEM_VisualMesh"))
+            {
+                Mesh visualMesh = new Mesh { name = "FEM_VisualMesh" };
+                visualMesh.MarkDynamic();
+                mf.mesh = visualMesh;
+            }
+            UpdateVisualMesh(true);
         }
 
         UpdateColliderMesh();
+        isInitialized = true;
     }
 
     private void PrecomputeRestMatrices()
     {
+        if (tetMesh == null || tetMesh.tets == null) return;
+
         invRestMatrices = new GPUMatrix3x3[tetMesh.tets.Count];
 
         for (int t = 0; t < tetMesh.tets.Count; t++)
         {
             var tet = tetMesh.tets[t];
 
-            Vector3 X0 = tetMesh.vertices[tet.v0];
-            Vector3 X1 = tetMesh.vertices[tet.v1];
-            Vector3 X2 = tetMesh.vertices[tet.v2];
-            Vector3 X3 = tetMesh.vertices[tet.v3];
+            if (!tet.active ||
+                tet.v0 >= tetMesh.vertices.Count || tet.v1 >= tetMesh.vertices.Count ||
+                tet.v2 >= tetMesh.vertices.Count || tet.v3 >= tetMesh.vertices.Count)
+            {
+                tet.active = false;
+                tetMesh.tets[t] = tet;
+                invRestMatrices[t] = new GPUMatrix3x3 { m00 = 1f, m11 = 1f, m22 = 1f };
+                continue;
+            }
+
+            Vector3 X0 = transform.TransformPoint(tetMesh.vertices[tet.v0]);
+            Vector3 X1 = transform.TransformPoint(tetMesh.vertices[tet.v1]);
+            Vector3 X2 = transform.TransformPoint(tetMesh.vertices[tet.v2]);
+            Vector3 X3 = transform.TransformPoint(tetMesh.vertices[tet.v3]);
 
             Vector3 Dm0 = X1 - X0;
             Vector3 Dm1 = X2 - X0;
             Vector3 Dm2 = X3 - X0;
 
-            FEMMatrix3x3 Dm = new FEMMatrix3x3(Dm0, Dm1, Dm2);
-            float det = Dm.Determinant();
+            Vector3 c0 = Vector3.Cross(Dm1, Dm2);
+            Vector3 c1 = Vector3.Cross(Dm2, Dm0);
+            Vector3 c2 = Vector3.Cross(Dm0, Dm1);
+
+            float det = Vector3.Dot(Dm0, c0);
 
             if (det < 0)
             {
-                int temp = tet.v1;
+                int tempV = tet.v1;
                 tet.v1 = tet.v2;
-                tet.v2 = temp;
+                tet.v2 = tempV;
 
-                Dm0 = tetMesh.vertices[tet.v1] - X0;
-                Dm1 = tetMesh.vertices[tet.v2] - X0;
-                Dm = new FEMMatrix3x3(Dm0, Dm1, Dm2);
-                det = Dm.Determinant();
+                X1 = transform.TransformPoint(tetMesh.vertices[tet.v1]);
+                X2 = transform.TransformPoint(tetMesh.vertices[tet.v2]);
+
+                Dm0 = X1 - X0;
+                Dm1 = X2 - X0;
+
+                c0 = Vector3.Cross(Dm1, Dm2);
+                c1 = Vector3.Cross(Dm2, Dm0);
+                c2 = Vector3.Cross(Dm0, Dm1);
+
+                det = Vector3.Dot(Dm0, c0);
             }
 
-            tet.restVolume = Mathf.Max(det / 6.0f, 1e-6f);
+            if (det < 1e-4f || float.IsNaN(det) || float.IsInfinity(det))
+            {
+                tet.active = false;
+                tetMesh.tets[t] = tet;
+                invRestMatrices[t] = new GPUMatrix3x3 { m00 = 1f, m11 = 1f, m22 = 1f };
+                continue;
+            }
+
+            tet.restVolume = det / 6.0f;
             tetMesh.tets[t] = tet;
 
-            FEMMatrix3x3 invDm = (Mathf.Abs(det) > 1e-7f) ? Dm.Inverse() : FEMMatrix3x3.Identity;
-
+            float invDet = 1.0f / det;
             invRestMatrices[t] = new GPUMatrix3x3
             {
-                m00 = invDm.m00,
-                m01 = invDm.m01,
-                m02 = invDm.m02,
-                m10 = invDm.m10,
-                m11 = invDm.m11,
-                m12 = invDm.m12,
-                m20 = invDm.m20,
-                m21 = invDm.m21,
-                m22 = invDm.m22
+                m00 = c0.x * invDet,
+                m01 = c1.x * invDet,
+                m02 = c2.x * invDet,
+                m10 = c0.y * invDet,
+                m11 = c1.y * invDet,
+                m12 = c2.y * invDet,
+                m20 = c0.z * invDet,
+                m21 = c1.z * invDet,
+                m22 = c2.z * invDet
             };
         }
     }
@@ -237,16 +320,14 @@ public class FEMPhysicsBody : MonoBehaviour
         int numVerts = (positions != null) ? positions.Length : 0;
         int numTets = (tetMesh != null && tetMesh.tets != null) ? tetMesh.tets.Count : 0;
 
-        if (numVerts == 0 || numTets == 0)
-        {
-            Debug.LogError($"FEMPhysicsBody: Cannot initialize GPU resources. Vertices: {numVerts}, Tetrahedra: {numTets}.");
-            return;
-        }
+        if (numVerts == 0 || numTets == 0) return;
 
         kIntegrate = femComputeShader.FindKernel("KernelIntegrate");
         kSolveFEM = femComputeShader.FindKernel("KernelSolveFEM");
         kApplyDeltas = femComputeShader.FindKernel("KernelApplyDeltas");
         kPostPhysics = femComputeShader.FindKernel("KernelPostPhysics");
+        kParticleCollisions = femComputeShader.FindKernel("KernelParticleCollisions");
+        kInterBodyCollisions = femComputeShader.FindKernel("KernelInterBodyCollisions");
 
         positionsBuffer = new ComputeBuffer(numVerts, sizeof(float) * 3);
         prevPositionsBuffer = new ComputeBuffer(numVerts, sizeof(float) * 3);
@@ -285,7 +366,7 @@ public class FEMPhysicsBody : MonoBehaviour
 
     private void BindBuffersToKernels()
     {
-        int[] kernels = { kIntegrate, kSolveFEM, kApplyDeltas, kPostPhysics };
+        int[] kernels = { kIntegrate, kSolveFEM, kApplyDeltas, kPostPhysics, kParticleCollisions, kInterBodyCollisions };
         foreach (int k in kernels)
         {
             femComputeShader.SetBuffer(k, "positionsBuffer", positionsBuffer);
@@ -301,7 +382,7 @@ public class FEMPhysicsBody : MonoBehaviour
 
     private void FixedUpdate()
     {
-        if (femComputeShader == null || positionsBuffer == null || !positionsBuffer.IsValid() || tetsBuffer == null || !tetsBuffer.IsValid()) return;
+        if (femComputeShader == null || positionsBuffer == null || !positionsBuffer.IsValid()) return;
 
         int numVerts = (positions != null) ? positions.Length : 0;
         int numTets = (tetMesh != null && tetMesh.tets != null) ? tetMesh.tets.Count : 0;
@@ -313,7 +394,8 @@ public class FEMPhysicsBody : MonoBehaviour
 
         float dt = Time.fixedDeltaTime / solverSubsteps;
         float mu = youngsModulus / (2.0f * (1.0f + poissonsRatio));
-        float lambda = (youngsModulus * poissonsRatio) / ((1.0f + poissonsRatio) * (1.0f - 2.0f * poissonsRatio));
+        float lambda = (youngsModulus * poissonsRatio) / ((1.0f + poissonsRatio) * Mathf.Max(0.01f, 1.0f - 2.0f * poissonsRatio));
+        float maxDisp = Mathf.Min(0.01f, targetTetSize * 0.2f);
 
         femComputeShader.SetInt("numVertices", numVerts);
         femComputeShader.SetInt("numTets", numTets);
@@ -322,109 +404,176 @@ public class FEMPhysicsBody : MonoBehaviour
         femComputeShader.SetFloat("lambda", lambda);
         femComputeShader.SetFloat("damping", damping);
         femComputeShader.SetVector("gravity", gravity);
-        femComputeShader.SetFloat("maxDisplacement", 0.05f);
+        femComputeShader.SetFloat("maxDisplacement", maxDisp);
         femComputeShader.SetFloat("floorY", floorY);
         femComputeShader.SetInt("enableFloorCollision", enableFloorCollision ? 1 : 0);
+        femComputeShader.SetFloat("particleRadius", particleRadius);
 
         for (int step = 0; step < solverSubsteps; step++)
         {
             femComputeShader.Dispatch(kIntegrate, vertGroups, 1, 1);
-            femComputeShader.Dispatch(kSolveFEM, tetGroups, 1, 1);
-            femComputeShader.Dispatch(kApplyDeltas, vertGroups, 1, 1);
+
+            if (enableSelfCollision)
+            {
+                femComputeShader.Dispatch(kParticleCollisions, vertGroups, 1, 1);
+            }
+
+            // --- INTER-BODY COLLISIONS ---
+            for (int b = 0; b < allActiveBodies.Count; b++)
+            {
+                FEMPhysicsBody otherBody = allActiveBodies[b];
+                if (otherBody == null || otherBody == this) continue;
+
+                ComputeBuffer otherBuffer = otherBody.PositionsBuffer;
+                if (otherBuffer != null && otherBuffer.IsValid() && otherBody.CurrentPositions != null && otherBody.CurrentPositions.Length > 0)
+                {
+                    femComputeShader.SetBuffer(kInterBodyCollisions, "positionsBuffer", positionsBuffer);
+                    femComputeShader.SetBuffer(kInterBodyCollisions, "invMassesBuffer", invMassesBuffer);
+                    femComputeShader.SetBuffer(kInterBodyCollisions, "deltaPosIntBuffer", deltaPosIntBuffer);
+                    femComputeShader.SetBuffer(kInterBodyCollisions, "deltaCountBuffer", deltaCountBuffer);
+                    femComputeShader.SetBuffer(kInterBodyCollisions, "otherPositionsBuffer", otherBuffer);
+
+                    femComputeShader.SetInt("numVertices", numVerts);
+                    femComputeShader.SetInt("numOtherVertices", otherBody.CurrentPositions.Length);
+                    femComputeShader.SetFloat("particleRadius", particleRadius);
+
+                    femComputeShader.Dispatch(kInterBodyCollisions, vertGroups, 1, 1);
+                }
+            }
+
+            for (int iter = 0; iter < solverIterations; iter++)
+            {
+                femComputeShader.Dispatch(kSolveFEM, tetGroups, 1, 1);
+                femComputeShader.Dispatch(kApplyDeltas, vertGroups, 1, 1);
+            }
+
             femComputeShader.Dispatch(kPostPhysics, vertGroups, 1, 1);
         }
 
         positionsBuffer.GetData(positions);
 
-        if (GetComponent<FEMVisualShell>() == null)
+        if (cachedVisualShell == null)
         {
-            UpdateVisualMesh();
+            UpdateVisualMesh(false);
         }
     }
 
-    private void UpdateVisualMesh()
+    private void UpdateLocalPositionsCache()
+    {
+        if (localVertsCache == null || localVertsCache.Length != positions.Length)
+        {
+            localVertsCache = new Vector3[positions.Length];
+        }
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            localVertsCache[i] = transform.InverseTransformPoint(positions[i]);
+        }
+    }
+
+    private void UpdateVisualMesh(bool fullRebuild = false)
     {
         MeshFilter mf = GetComponent<MeshFilter>();
         if (mf == null || tetMesh == null || mf.mesh == null) return;
 
-        List<int> tris = tetMesh.ReconstructSurfaceTriangles();
-
-        Vector3[] localVerts = new Vector3[positions.Length];
-        for (int i = 0; i < positions.Length; i++)
-        {
-            localVerts[i] = transform.InverseTransformPoint(positions[i]);
-        }
+        UpdateLocalPositionsCache();
 
         Mesh vMesh = mf.mesh;
-        vMesh.Clear();
-        vMesh.vertices = localVerts;
-        vMesh.triangles = tris.ToArray();
+        if (fullRebuild || cachedSurfaceTriangles == null || vMesh.vertexCount != localVertsCache.Length)
+        {
+            cachedSurfaceTriangles = tetMesh.ReconstructSurfaceTriangles().ToArray();
+            vMesh.Clear();
+            vMesh.vertices = localVertsCache;
+            vMesh.triangles = cachedSurfaceTriangles;
+        }
+        else
+        {
+            vMesh.vertices = localVertsCache;
+        }
+
         vMesh.RecalculateNormals();
         vMesh.RecalculateBounds();
     }
 
     private void UpdateColliderMesh()
     {
-        MeshCollider mc = GetComponent<MeshCollider>();
-        if (mc == null) return;
+        if (positions == null || positions.Length == 0) return;
 
-        List<int> rawTris = tetMesh.ReconstructSurfaceTriangles();
-        List<int> validTris = GetNonDegenerateTriangles(rawTris);
-
-        if (validTris.Count < 3)
+        BoxCollider boxCol = GetComponent<BoxCollider>();
+        if (boxCol == null)
         {
-            mc.sharedMesh = null;
-            return;
+            boxCol = gameObject.AddComponent<BoxCollider>();
         }
 
-        Mesh colMesh = new Mesh();
-        Vector3[] localVerts = new Vector3[positions.Length];
-        for (int i = 0; i < positions.Length; i++)
+        Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+        int activeCount = 0;
+
+        if (tetMesh != null && tetMesh.tets != null)
         {
-            localVerts[i] = transform.InverseTransformPoint(positions[i]);
-        }
-
-        colMesh.vertices = localVerts;
-        colMesh.triangles = validTris.ToArray();
-        colMesh.RecalculateBounds();
-
-        mc.sharedMesh = null;
-        mc.sharedMesh = colMesh;
-    }
-
-    private List<int> GetNonDegenerateTriangles(List<int> rawTris)
-    {
-        List<int> validTris = new List<int>();
-        for (int i = 0; i < rawTris.Count; i += 3)
-        {
-            Vector3 v0 = positions[rawTris[i]];
-            Vector3 v1 = positions[rawTris[i + 1]];
-            Vector3 v2 = positions[rawTris[i + 2]];
-
-            if (Vector3.Cross(v1 - v0, v2 - v0).sqrMagnitude > 1e-7f)
+            bool[] activeVerts = new bool[positions.Length];
+            foreach (var tet in tetMesh.tets)
             {
-                validTris.Add(rawTris[i]);
-                validTris.Add(rawTris[i + 1]);
-                validTris.Add(rawTris[i + 2]);
+                if (!tet.active) continue;
+                activeVerts[tet.v0] = true;
+                activeVerts[tet.v1] = true;
+                activeVerts[tet.v2] = true;
+                activeVerts[tet.v3] = true;
+            }
+
+            for (int i = 0; i < positions.Length; i++)
+            {
+                if (activeVerts[i])
+                {
+                    Vector3 localPos = transform.InverseTransformPoint(positions[i]);
+                    min = Vector3.Min(min, localPos);
+                    max = Vector3.Max(max, localPos);
+                    activeCount++;
+                }
             }
         }
-        return validTris;
+        else
+        {
+            for (int i = 0; i < positions.Length; i++)
+            {
+                Vector3 localPos = transform.InverseTransformPoint(positions[i]);
+                min = Vector3.Min(min, localPos);
+                max = Vector3.Max(max, localPos);
+                activeCount++;
+            }
+        }
+
+        if (activeCount == 0) return;
+
+        Vector3 size = max - min;
+        size.x = Mathf.Max(size.x, 0.01f);
+        size.y = Mathf.Max(size.y, 0.01f);
+        size.z = Mathf.Max(size.z, 0.01f);
+
+        boxCol.center = (min + max) * 0.5f;
+        boxCol.size = size;
     }
 
     private void ReleaseGPUResources()
     {
-        positionsBuffer?.Release();
-        prevPositionsBuffer?.Release();
-        velocitiesBuffer?.Release();
-        invMassesBuffer?.Release();
-        tetsBuffer?.Release();
-        invRestMatricesBuffer?.Release();
-        deltaPosIntBuffer?.Release();
-        deltaCountBuffer?.Release();
+        if (positionsBuffer != null) { positionsBuffer.Release(); positionsBuffer = null; }
+        if (prevPositionsBuffer != null) { prevPositionsBuffer.Release(); prevPositionsBuffer = null; }
+        if (velocitiesBuffer != null) { velocitiesBuffer.Release(); velocitiesBuffer = null; }
+        if (invMassesBuffer != null) { invMassesBuffer.Release(); invMassesBuffer = null; }
+        if (tetsBuffer != null) { tetsBuffer.Release(); tetsBuffer = null; }
+        if (invRestMatricesBuffer != null) { invRestMatricesBuffer.Release(); invRestMatricesBuffer = null; }
+        if (deltaPosIntBuffer != null) { deltaPosIntBuffer.Release(); deltaPosIntBuffer = null; }
+        if (deltaCountBuffer != null) { deltaCountBuffer.Release(); deltaCountBuffer = null; }
     }
 
-    private void OnDisable() => ReleaseGPUResources();
-    private void OnDestroy() => ReleaseGPUResources();
+    private void OnDestroy()
+    {
+        ReleaseGPUResources();
+        if (generatedColliderMesh != null)
+        {
+            Destroy(generatedColliderMesh);
+        }
+    }
 
     private void OnDrawGizmos()
     {
@@ -434,6 +583,8 @@ public class FEMPhysicsBody : MonoBehaviour
         foreach (var tet in tetMesh.tets)
         {
             if (!tet.active) continue;
+            if (tet.v0 >= positions.Length || tet.v1 >= positions.Length || tet.v2 >= positions.Length || tet.v3 >= positions.Length) continue;
+
             Gizmos.DrawLine(positions[tet.v0], positions[tet.v1]);
             Gizmos.DrawLine(positions[tet.v0], positions[tet.v2]);
             Gizmos.DrawLine(positions[tet.v0], positions[tet.v3]);
@@ -447,42 +598,87 @@ public class FEMPhysicsBody : MonoBehaviour
     // CUTTING & CHUNK SEPARATION LOGIC
     // ==========================================
 
-    /// <summary>
-    /// Call this method whenever a cutting operation deactivates tetrahedra.
-    /// It cleans up orphaned elements, detects disconnected mesh islands,
-    /// and instantiates isolated pieces into independent physics GameObjects.
-    /// </summary>
     public void OnMeshCut() => NotifyMeshCut();
 
     public void NotifyMeshCut()
     {
-        CleanupDanglingTetrahedra();
+        if (tetMesh == null) return;
 
+        MeshCutter.RecordCutForBody(this);
+
+        CleanupDanglingTetrahedra();
+        UpdateOrphanVertices();
         List<List<int>> islands = FindConnectedIslands();
 
-        if (islands.Count > 1)
+        if (islands == null || islands.Count == 0)
         {
-            // Update current body with Island 0
-            this.tetMesh = CreateSubTetMesh(islands[0], out List<Vector3> island0Positions);
-            ReinitializeBody(island0Positions);
+            Destroy(gameObject);
+            return;
+        }
 
-            // Spawn separate GameObjects for Islands 1..N
-            for (int i = 1; i < islands.Count; i++)
-            {
-                TetrahedralMesh chunkMesh = CreateSubTetMesh(islands[i], out List<Vector3> chunkPositions);
-                SpawnChunkGameObject(chunkMesh, chunkPositions);
-            }
+        List<TetrahedralMesh> extractedMeshes = new List<TetrahedralMesh>();
+        List<List<Vector3>> extractedPositions = new List<List<Vector3>>();
+        List<List<Vector3>> extractedRestPositions = new List<List<Vector3>>();
+
+        for (int i = 0; i < islands.Count; i++)
+        {
+            TetrahedralMesh subMesh = CreateSubTetMesh(islands[i], out List<Vector3> pos, out List<Vector3> restPos);
+            extractedMeshes.Add(subMesh);
+            extractedPositions.Add(pos);
+            extractedRestPositions.Add(restPos);
+        }
+
+        if (extractedMeshes[0].tets.Count > 0 && extractedPositions[0].Count > 0)
+        {
+            this.tetMesh = extractedMeshes[0];
+            InitializePhysicsState(extractedPositions[0], extractedRestPositions[0]);
         }
         else
         {
-            ReinitializeBody();
+            Destroy(gameObject);
+            return;
         }
 
-        FEMVisualShell visualShell = GetComponent<FEMVisualShell>();
-        if (visualShell != null)
+        for (int i = 1; i < islands.Count; i++)
         {
-            visualShell.OnMeshCut();
+            if (extractedMeshes[i].tets.Count > 0 && extractedPositions[i].Count > 0)
+            {
+                SpawnChunkGameObject(extractedMeshes[i], extractedPositions[i], extractedRestPositions[i]);
+            }
         }
+
+        FEMVisualShell[] shells = GetComponentsInChildren<FEMVisualShell>();
+        foreach (var shell in shells)
+        {
+            shell.OnMeshCut();
+        }
+    }
+
+    public void UpdateOrphanVertices()
+    {
+        if (positions == null || tetMesh == null || tetMesh.tets == null) return;
+
+        bool[] activeVerts = new bool[positions.Length];
+
+        foreach (var tet in tetMesh.tets)
+        {
+            if (!tet.active) continue;
+            activeVerts[tet.v0] = true;
+            activeVerts[tet.v1] = true;
+            activeVerts[tet.v2] = true;
+            activeVerts[tet.v3] = true;
+        }
+
+        for (int i = 0; i < positions.Length; i++)
+        {
+            if (!activeVerts[i])
+            {
+                velocities[i] = Vector3.zero;
+                if (restPositions != null && i < restPositions.Length)
+                    positions[i] = restPositions[i];
+            }
+        }
+        UpdateColliderMesh();
     }
 
     private List<List<int>> FindConnectedIslands()
@@ -492,7 +688,6 @@ public class FEMPhysicsBody : MonoBehaviour
 
         bool[] visited = new bool[tetMesh.tets.Count];
 
-        // Build vertex-to-tetrahedra lookup map
         Dictionary<int, List<int>> vertToTets = new Dictionary<int, List<int>>();
         for (int i = 0; i < tetMesh.tets.Count; i++)
         {
@@ -511,7 +706,6 @@ public class FEMPhysicsBody : MonoBehaviour
             }
         }
 
-        // Breadth-first search for connected components
         for (int i = 0; i < tetMesh.tets.Count; i++)
         {
             if (visited[i] || !tetMesh.tets[i].active) continue;
@@ -551,53 +745,74 @@ public class FEMPhysicsBody : MonoBehaviour
         return islands;
     }
 
-    private TetrahedralMesh CreateSubTetMesh(List<int> islandTetIndices, out List<Vector3> extractedPositions)
+    public TetrahedralMesh CreateSubTetMesh(List<int> tetIndices, out List<Vector3> outPositions, out List<Vector3> outRestPositions)
     {
         TetrahedralMesh subMesh = new TetrahedralMesh
         {
             vertices = new List<Vector3>(),
             tets = new List<Tetrahedron>()
         };
+        outPositions = new List<Vector3>();
+        outRestPositions = new List<Vector3>();
 
-        List<Vector3> positionsList = new List<Vector3>();
+        if (tetMesh == null || tetMesh.tets == null || tetIndices == null)
+            return subMesh;
+
         Dictionary<int, int> oldToNewVertMap = new Dictionary<int, int>();
 
-        int GetMappedVertex(int oldIdx)
+        foreach (int tetIdx in tetIndices)
         {
-            if (oldToNewVertMap.TryGetValue(oldIdx, out int newIdx))
-                return newIdx;
+            if (tetIdx < 0 || tetIdx >= tetMesh.tets.Count) continue;
 
-            newIdx = subMesh.vertices.Count;
-            subMesh.vertices.Add(tetMesh.vertices[oldIdx]);
-            positionsList.Add(positions[oldIdx]);
-            oldToNewVertMap[oldIdx] = newIdx;
-            return newIdx;
-        }
+            var origTet = tetMesh.tets[tetIdx];
+            if (!origTet.active) continue;
 
-        foreach (int tetIdx in islandTetIndices)
-        {
-            Tetrahedron oldTet = tetMesh.tets[tetIdx];
-            if (!oldTet.active) continue;
+            int[] oldVerts = { origTet.v0, origTet.v1, origTet.v2, origTet.v3 };
+            int[] newVerts = new int[4];
 
-            int nv0 = GetMappedVertex(oldTet.v0);
-            int nv1 = GetMappedVertex(oldTet.v1);
-            int nv2 = GetMappedVertex(oldTet.v2);
-            int nv3 = GetMappedVertex(oldTet.v3);
-
-            Tetrahedron newTet = new Tetrahedron(nv0, nv1, nv2, nv3)
+            for (int i = 0; i < 4; i++)
             {
-                restVolume = oldTet.restVolume,
+                int oldV = oldVerts[i];
+                if (!oldToNewVertMap.TryGetValue(oldV, out int newV))
+                {
+                    newV = subMesh.vertices.Count;
+                    oldToNewVertMap[oldV] = newV;
+
+                    if (oldV < tetMesh.vertices.Count)
+                        subMesh.vertices.Add(tetMesh.vertices[oldV]);
+                    else
+                        subMesh.vertices.Add(Vector3.zero);
+
+                    if (positions != null && oldV < positions.Length)
+                        outPositions.Add(positions[oldV]);
+                    else
+                        outPositions.Add(transform.TransformPoint(subMesh.vertices[newV]));
+
+                    if (restPositions != null && oldV < restPositions.Length)
+                        outRestPositions.Add(restPositions[oldV]);
+                    else
+                        outRestPositions.Add(transform.TransformPoint(subMesh.vertices[newV]));
+                }
+                newVerts[i] = newV;
+            }
+
+            Tetrahedron newTet = new Tetrahedron
+            {
+                v0 = newVerts[0],
+                v1 = newVerts[1],
+                v2 = newVerts[2],
+                v3 = newVerts[3],
+                restVolume = origTet.restVolume,
                 active = true
             };
 
             subMesh.tets.Add(newTet);
         }
 
-        extractedPositions = positionsList;
         return subMesh;
     }
 
-    private void SpawnChunkGameObject(TetrahedralMesh chunkMesh, List<Vector3> chunkPositions)
+    private void SpawnChunkGameObject(TetrahedralMesh chunkMesh, List<Vector3> chunkPositions, List<Vector3> chunkRestPositions)
     {
         GameObject chunkGO = new GameObject(gameObject.name + "_Piece");
         chunkGO.transform.position = transform.position;
@@ -606,84 +821,61 @@ public class FEMPhysicsBody : MonoBehaviour
 
         MeshFilter mf = chunkGO.AddComponent<MeshFilter>();
         MeshRenderer mr = chunkGO.AddComponent<MeshRenderer>();
+
         MeshRenderer myRenderer = GetComponent<MeshRenderer>();
-        if (myRenderer != null) mr.sharedMaterials = myRenderer.sharedMaterials;
+        if (myRenderer != null && myRenderer.sharedMaterials.Length > 0)
+        {
+            mr.sharedMaterials = myRenderer.sharedMaterials;
+        }
 
         FEMPhysicsBody newBody = chunkGO.AddComponent<FEMPhysicsBody>();
+        newBody.drawTetWireframe = false;
         newBody.sourceMesh = this.sourceMesh;
         newBody.femComputeShader = this.femComputeShader;
         newBody.youngsModulus = this.youngsModulus;
         newBody.poissonsRatio = this.poissonsRatio;
         newBody.solverSubsteps = this.solverSubsteps;
+        newBody.solverIterations = this.solverIterations;
         newBody.particleMass = this.particleMass;
         newBody.damping = this.damping;
         newBody.gravity = this.gravity;
         newBody.enableFloorCollision = this.enableFloorCollision;
         newBody.floorY = this.floorY;
 
-        MeshCollider mc = chunkGO.AddComponent<MeshCollider>();
-        mc.convex = true;
+        BoxCollider mc = chunkGO.AddComponent<BoxCollider>();
 
         newBody.tetMesh = chunkMesh;
-        newBody.InitializePhysicsState(chunkPositions);
-    }
+        newBody.InitializePhysicsState(chunkPositions, chunkRestPositions);
 
-    private void ReinitializeBody(List<Vector3> customWorldPositions = null)
-    {
-        if (customWorldPositions != null)
-        {
-            InitializePhysicsState(customWorldPositions);
-        }
-        else
-        {
-            PrecomputeRestMatrices();
-            InitializeGPUResources();
-            UpdateVisualMesh();
-            UpdateColliderMesh();
-        }
+        MeshCutter.RecordCutForBody(newBody);
     }
 
     public void CleanupDanglingTetrahedra()
     {
         if (tetMesh == null || tetMesh.tets == null) return;
-
-        int maxPasses = 3;
-        for (int pass = 0; pass < maxPasses; pass++)
+        Dictionary<int, int> vertTetCounts = new Dictionary<int, int>();
+        for (int i = 0; i < tetMesh.tets.Count; i++)
         {
-            bool removedInPass = false;
+            var tet = tetMesh.tets[i];
+            if (!tet.active) continue;
 
-            Dictionary<int, int> vertTetCounts = new Dictionary<int, int>();
-            for (int i = 0; i < tetMesh.tets.Count; i++)
+            vertTetCounts[tet.v0] = vertTetCounts.TryGetValue(tet.v0, out int c0) ? c0 + 1 : 1;
+            vertTetCounts[tet.v1] = vertTetCounts.TryGetValue(tet.v1, out int c1) ? c1 + 1 : 1;
+            vertTetCounts[tet.v2] = vertTetCounts.TryGetValue(tet.v2, out int c2) ? c2 + 1 : 1;
+            vertTetCounts[tet.v3] = vertTetCounts.TryGetValue(tet.v3, out int c3) ? c3 + 1 : 1;
+        }
+
+        for (int i = 0; i < tetMesh.tets.Count; i++)
+        {
+            var tet = tetMesh.tets[i];
+            if (!tet.active) continue;
+
+            if (vertTetCounts[tet.v0] == 1 && vertTetCounts[tet.v1] == 1 &&
+                vertTetCounts[tet.v2] == 1 && vertTetCounts[tet.v3] == 1)
             {
-                var tet = tetMesh.tets[i];
-                if (!tet.active) continue;
-
-                vertTetCounts[tet.v0] = vertTetCounts.TryGetValue(tet.v0, out int c0) ? c0 + 1 : 1;
-                vertTetCounts[tet.v1] = vertTetCounts.TryGetValue(tet.v1, out int c1) ? c1 + 1 : 1;
-                vertTetCounts[tet.v2] = vertTetCounts.TryGetValue(tet.v2, out int c2) ? c2 + 1 : 1;
-                vertTetCounts[tet.v3] = vertTetCounts.TryGetValue(tet.v3, out int c3) ? c3 + 1 : 1;
+                tet.active = false;
+                tetMesh.tets[i] = tet;
             }
-
-            for (int i = 0; i < tetMesh.tets.Count; i++)
-            {
-                var tet = tetMesh.tets[i];
-                if (!tet.active) continue;
-
-                int lonelyVerts = 0;
-                if ((vertTetCounts.TryGetValue(tet.v0, out int count0) ? count0 : 0) == 1) lonelyVerts++;
-                if ((vertTetCounts.TryGetValue(tet.v1, out int count1) ? count1 : 0) == 1) lonelyVerts++;
-                if ((vertTetCounts.TryGetValue(tet.v2, out int count2) ? count2 : 0) == 1) lonelyVerts++;
-                if ((vertTetCounts.TryGetValue(tet.v3, out int count3) ? count3 : 0) == 1) lonelyVerts++;
-
-                if (lonelyVerts >= 2)
-                {
-                    tet.active = false;
-                    tetMesh.tets[i] = tet;
-                    removedInPass = true;
-                }
-            }
-
-            if (!removedInPass) break;
         }
     }
 }

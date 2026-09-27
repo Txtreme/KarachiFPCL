@@ -13,20 +13,54 @@ public class MeshCutter : MonoBehaviour
     [Header("Cutter Mode")]
     public CutMode cutMode = CutMode.BoxCollider;
 
-    [Header("Continuous Cutting")]
-    public bool cutOnTrigger = false; // Set to false so Box and Mesh cuts run continuously in Update
+    [Header("Continuous Cutting Settings")]
+    public bool cutOnTrigger = true;
+    [Tooltip("Cooldown in seconds between cuts on the same body to prevent frame-by-frame cascade destruction.")]
+    public float cutCooldown = 0.35f;
 
     [Header("Thickness / Margin Tuning")]
-    public float bladeThicknessMargin = 0.05f;
+    [Tooltip("Margin around cutter box for vertex inclusion.")]
+    public float bladeThicknessMargin = 0.005f;
 
     [Header("Plane Sweep Settings (PlaneSweep Mode)")]
-    public float cutRadius = 0.5f;
+    public float cutRadius = 0.15f;
+    [Tooltip("Which local axis of the cutter represents the flat blade normal? (Default: Up)")]
+    public Vector3 bladePlaneNormalAxis = Vector3.up;
 
     [Header("Collider References")]
     public BoxCollider targetBoxCollider;
     public MeshCollider targetMeshCollider;
 
     private Vector3 prevPosition;
+
+    private static readonly List<FEMPhysicsBody> activeBodies = new List<FEMPhysicsBody>();
+    private static readonly RaycastHit[] raycastHitBuffer = new RaycastHit[128];
+    private static readonly Dictionary<FEMPhysicsBody, float> lastCutTimes = new Dictionary<FEMPhysicsBody, float>();
+
+    public static void RegisterBody(FEMPhysicsBody body)
+    {
+        if (body != null && !activeBodies.Contains(body))
+        {
+            activeBodies.Add(body);
+        }
+    }
+
+    public static void UnregisterBody(FEMPhysicsBody body)
+    {
+        if (body != null)
+        {
+            activeBodies.Remove(body);
+            lastCutTimes.Remove(body);
+        }
+    }
+
+    public static void RecordCutForBody(FEMPhysicsBody body)
+    {
+        if (body != null)
+        {
+            lastCutTimes[body] = Time.time;
+        }
+    }
 
     private void Reset()
     {
@@ -39,6 +73,33 @@ public class MeshCutter : MonoBehaviour
         prevPosition = transform.position;
         if (targetBoxCollider == null) targetBoxCollider = GetComponent<BoxCollider>();
         if (targetMeshCollider == null) targetMeshCollider = GetComponent<MeshCollider>();
+
+        RefreshBodyCache();
+    }
+
+    private void RefreshBodyCache()
+    {
+        if (activeBodies.Count == 0)
+        {
+            FEMPhysicsBody[] femBodies = Object.FindObjectsByType<FEMPhysicsBody>(
+                FindObjectsInactive.Exclude,
+                FindObjectsSortMode.None
+            );
+            foreach (var body in femBodies)
+            {
+                RegisterBody(body);
+            }
+        }
+    }
+
+    public bool CanCutBody(FEMPhysicsBody body)
+    {
+        if (body == null) return false;
+        if (lastCutTimes.TryGetValue(body, out float lastTime))
+        {
+            if (Time.time - lastTime < cutCooldown) return false;
+        }
+        return true;
     }
 
     private void Update()
@@ -54,13 +115,12 @@ public class MeshCutter : MonoBehaviour
             if (sweepLength > 0.001f)
             {
                 Vector3 sweepNorm = sweepDir / sweepLength;
-                Vector3 planeNormal = Vector3.Cross(sweepNorm, transform.forward).normalized;
-                if (planeNormal == Vector3.zero) planeNormal = transform.up;
+                Vector3 planeNormal = transform.TransformDirection(bladePlaneNormalAxis).normalized;
 
                 PerformPlaneSweepCut(prevPosition, currentPosition, sweepNorm, sweepLength, planeNormal);
             }
         }
-        else if (!cutOnTrigger && movementSqr > 0.00001f) // Execute volume cut only when cutter moved
+        else if (!cutOnTrigger && movementSqr > 0.00001f)
         {
             PerformVolumeCut();
         }
@@ -94,19 +154,19 @@ public class MeshCutter : MonoBehaviour
 
     public void PerformVolumeCut()
     {
-        FEMPhysicsBody[] femBodies = Object.FindObjectsByType<FEMPhysicsBody>(
-            FindObjectsInactive.Exclude,
-            FindObjectsSortMode.None
-        );
+        activeBodies.RemoveAll(b => b == null);
+        if (activeBodies.Count == 0) RefreshBodyCache();
 
-        foreach (var body in femBodies)
+        for (int i = activeBodies.Count - 1; i >= 0; i--)
         {
-            CutSingleBodyVolume(body);
+            CutSingleBodyVolume(activeBodies[i]);
         }
     }
 
     public bool CutSingleBodyVolume(FEMPhysicsBody body)
     {
+        if (body == null || !CanCutBody(body)) return false;
+
         TetrahedralMesh tetMesh = body.TetMesh;
         Vector3[] positions = body.CurrentPositions;
 
@@ -125,6 +185,9 @@ public class MeshCutter : MonoBehaviour
             var tet = tetMesh.tets[i];
             if (!tet.active) continue;
 
+            if (tet.v0 >= positions.Length || tet.v1 >= positions.Length ||
+                tet.v2 >= positions.Length || tet.v3 >= positions.Length) continue;
+
             Vector3 p0 = positions[tet.v0];
             Vector3 p1 = positions[tet.v1];
             Vector3 p2 = positions[tet.v2];
@@ -135,15 +198,14 @@ public class MeshCutter : MonoBehaviour
 
             if (cutMode == CutMode.BoxCollider)
             {
-                isInside = IsTetInsideBox(p0, p1, p2, p3, tetCenter, box, bladeThicknessMargin);
+                isInside = IsTetIntersectingBox(p0, p1, p2, p3, tetCenter, box, bladeThicknessMargin);
             }
             else if (cutMode == CutMode.CustomMeshCollider)
             {
-                isInside = IsPointInsideMesh(tetCenter, meshCol) ||
-                           IsPointInsideMesh(p0, meshCol) ||
-                           IsPointInsideMesh(p1, meshCol) ||
-                           IsPointInsideMesh(p2, meshCol) ||
-                           IsPointInsideMesh(p3, meshCol);
+                if (meshCol.bounds.Contains(tetCenter))
+                {
+                    isInside = IsPointInsideMesh(tetCenter, meshCol);
+                }
             }
 
             if (isInside)
@@ -156,30 +218,45 @@ public class MeshCutter : MonoBehaviour
 
         if (meshCutOccurred)
         {
+            RecordCutForBody(body);
             body.NotifyMeshCut();
         }
 
         return meshCutOccurred;
     }
 
-    private bool IsTetInsideBox(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector3 tetCenter, BoxCollider box, float margin)
+    private bool IsTetIntersectingBox(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector3 tetCenter, BoxCollider box, float margin)
     {
         Matrix4x4 worldToLocal = box.transform.worldToLocalMatrix;
         Vector3 halfSize = (box.size * 0.5f) + new Vector3(margin, margin, margin);
         Vector3 boxCenter = box.center;
 
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4(tetCenter) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4(p0) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4(p1) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4(p2) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4(p3) - boxCenter, halfSize)) return true;
+        Vector3 lCenter = worldToLocal.MultiplyPoint3x4(tetCenter) - boxCenter;
+        if (IsLocalPointInBox(lCenter, halfSize)) return true;
 
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p0 + p1) * 0.5f) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p0 + p2) * 0.5f) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p0 + p3) * 0.5f) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p1 + p2) * 0.5f) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p1 + p3) * 0.5f) - boxCenter, halfSize)) return true;
-        if (IsLocalPointInBox(worldToLocal.MultiplyPoint3x4((p2 + p3) * 0.5f) - boxCenter, halfSize)) return true;
+        Vector3 lp0 = worldToLocal.MultiplyPoint3x4(p0) - boxCenter;
+        Vector3 lp1 = worldToLocal.MultiplyPoint3x4(p1) - boxCenter;
+        Vector3 lp2 = worldToLocal.MultiplyPoint3x4(p2) - boxCenter;
+        Vector3 lp3 = worldToLocal.MultiplyPoint3x4(p3) - boxCenter;
+
+        int insideVerts = 0;
+        if (IsLocalPointInBox(lp0, halfSize)) insideVerts++;
+        if (IsLocalPointInBox(lp1, halfSize)) insideVerts++;
+        if (IsLocalPointInBox(lp2, halfSize)) insideVerts++;
+        if (IsLocalPointInBox(lp3, halfSize)) insideVerts++;
+
+        if (insideVerts >= 1) return true;
+
+        bool posZ = lp0.z > 0 || lp1.z > 0 || lp2.z > 0 || lp3.z > 0;
+        bool negZ = lp0.z < 0 || lp1.z < 0 || lp2.z < 0 || lp3.z < 0;
+
+        if (posZ && negZ)
+        {
+            if (Mathf.Abs(lCenter.x) <= halfSize.x && Mathf.Abs(lCenter.y) <= halfSize.y)
+            {
+                return true;
+            }
+        }
 
         return false;
     }
@@ -195,36 +272,44 @@ public class MeshCutter : MonoBehaviour
     {
         if (!meshCol.bounds.Contains(worldPoint)) return false;
 
-        // Directional raycast from outside the bounding box toward the point
-        Vector3 start = meshCol.bounds.min - new Vector3(1f, 1f, 1f);
+        bool oldHitBackfaces = Physics.queriesHitBackfaces;
+        Physics.queriesHitBackfaces = true;
+
+        Vector3 start = meshCol.bounds.min - new Vector3(0.1f, 0.1f, 0.1f);
         Vector3 dir = worldPoint - start;
         float dist = dir.magnitude;
-        if (dist < 0.0001f) return false;
+        if (dist < 0.0001f)
+        {
+            Physics.queriesHitBackfaces = oldHitBackfaces;
+            return false;
+        }
         dir /= dist;
 
-        RaycastHit[] hits = Physics.RaycastAll(start, dir, dist);
+        int numHits = Physics.RaycastNonAlloc(start, dir, raycastHitBuffer, dist);
         int hitCount = 0;
-        for (int i = 0; i < hits.Length; i++)
+
+        for (int i = 0; i < numHits; i++)
         {
-            if (hits[i].collider == meshCol)
+            if (raycastHitBuffer[i].collider == meshCol)
             {
                 hitCount++;
             }
         }
 
-        // An odd number of surface intersections indicates the point is inside the closed mesh
+        Physics.queriesHitBackfaces = oldHitBackfaces;
         return (hitCount % 2) == 1;
     }
 
     public void PerformPlaneSweepCut(Vector3 startPt, Vector3 endPt, Vector3 sweepNorm, float sweepLength, Vector3 planeNormal)
     {
-        FEMPhysicsBody[] femBodies = Object.FindObjectsByType<FEMPhysicsBody>(
-            FindObjectsInactive.Exclude,
-            FindObjectsSortMode.None
-        );
+        activeBodies.RemoveAll(b => b == null);
+        if (activeBodies.Count == 0) RefreshBodyCache();
 
-        foreach (var body in femBodies)
+        for (int bIdx = activeBodies.Count - 1; bIdx >= 0; bIdx--)
         {
+            var body = activeBodies[bIdx];
+            if (!CanCutBody(body)) continue;
+
             TetrahedralMesh tetMesh = body.TetMesh;
             Vector3[] positions = body.CurrentPositions;
 
@@ -236,6 +321,9 @@ public class MeshCutter : MonoBehaviour
             {
                 var tet = tetMesh.tets[i];
                 if (!tet.active) continue;
+
+                if (tet.v0 >= positions.Length || tet.v1 >= positions.Length ||
+                    tet.v2 >= positions.Length || tet.v3 >= positions.Length) continue;
 
                 Vector3 p0 = positions[tet.v0];
                 Vector3 p1 = positions[tet.v1];
@@ -254,8 +342,8 @@ public class MeshCutter : MonoBehaviour
                 float d2 = Vector3.Dot(p2 - closestPointOnSweep, planeNormal);
                 float d3 = Vector3.Dot(p3 - closestPointOnSweep, planeNormal);
 
-                bool holdsPos = d0 > 0 || d1 > 0 || d2 > 0 || d3 > 0;
-                bool holdsNeg = d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0;
+                bool holdsPos = d0 > 0.001f || d1 > 0.001f || d2 > 0.001f || d3 > 0.001f;
+                bool holdsNeg = d0 < -0.001f || d1 < -0.001f || d2 < -0.001f || d3 < -0.001f;
 
                 if (holdsPos && holdsNeg)
                 {
@@ -267,6 +355,7 @@ public class MeshCutter : MonoBehaviour
 
             if (meshCutOccurred)
             {
+                RecordCutForBody(body);
                 body.NotifyMeshCut();
             }
         }
