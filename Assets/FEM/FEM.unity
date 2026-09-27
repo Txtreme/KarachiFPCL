@@ -157,8 +157,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   cutMode: 0
   cutOnTrigger: 0
-  bladeThicknessMargin: 0.05
-  cutRadius: 0.5
+  cutCooldown: 0.1
+  bladeThicknessMargin: 0.25
+  cutRadius: 0.25
+  bladePlaneNormalAxis: {x: 0, y: 0, z: 2}
   targetBoxCollider: {fileID: 177101812}
   targetMeshCollider: {fileID: 0}
 --- !u!23 &177101809
@@ -220,8 +222,8 @@ Transform:
   m_GameObject: {fileID: 177101806}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 2.22, y: 2.56, z: -2.261}
-  m_LocalScale: {x: 1.786, y: 0.8831964, z: 0.017400056}
+  m_LocalPosition: {x: 3.18, y: 0.2, z: -2.261}
+  m_LocalScale: {x: 1.786, y: 0.8831964, z: 0.06241009}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
@@ -426,18 +428,20 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   sourceMesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
   femComputeShader: {fileID: 7200000, guid: 92b27b25fafd4604b8bee6d8271b9bb2, type: 3}
-  targetTetSize: 0.08
+  targetTetSize: 0.1
   gridResolution: {x: 8, y: 8, z: 8}
-  solverSubsteps: 10
-  solverIterations: 2
+  solverSubsteps: 15
+  solverIterations: 3
   particleMass: 0.1
   gravity: {x: 0, y: -9.81, z: 0}
   damping: 0.02
+  enableSelfCollision: 1
+  particleRadius: 0.025
   youngsModulus: 50000
   poissonsRatio: 0.45
   enableFloorCollision: 1
   floorY: 0
-  drawTetWireframe: 1
+  drawTetWireframe: 0
 --- !u!23 &907848978
 MeshRenderer:
   m_ObjectHideFlags: 0
@@ -497,7 +501,7 @@ Transform:
   m_GameObject: {fileID: 907848975}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 6.222498, y: 4.35, z: -2.161963}
+  m_LocalPosition: {x: 6.222498, y: 2.33, z: -2.161963}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -553,8 +557,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   cutMode: 0
   cutOnTrigger: 1
+  cutCooldown: 0.15
   bladeThicknessMargin: 0.05
   cutRadius: 0.32
+  bladePlaneNormalAxis: {x: 0, y: 1, z: 0}
   targetBoxCollider: {fileID: 0}
   targetMeshCollider: {fileID: 0}
 --- !u!64 &1000514212
@@ -639,6 +645,135 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 4.15, y: 1.8257669, z: -1.9533437}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1035859551
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1035859556}
+  - component: {fileID: 1035859555}
+  - component: {fileID: 1035859554}
+  - component: {fileID: 1035859553}
+  - component: {fileID: 1035859552}
+  m_Layer: 0
+  m_Name: F (1)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1035859552
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1035859551}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0a3d8453b21654d4dbe76b7ced9ca887, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  skinningComputeShader: {fileID: 7200000, guid: 95b824bca871b53429e194ba66491220, type: 3}
+  physicsBody: {fileID: 1035859553}
+  shellMode: 0
+  customVisualMesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!114 &1035859553
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1035859551}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a978afda96c693948b93b0d8b9231a40, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sourceMesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
+  femComputeShader: {fileID: 7200000, guid: 92b27b25fafd4604b8bee6d8271b9bb2, type: 3}
+  targetTetSize: 0.1
+  gridResolution: {x: 8, y: 8, z: 8}
+  solverSubsteps: 15
+  solverIterations: 3
+  particleMass: 0.1
+  gravity: {x: 0, y: -9.81, z: 0}
+  damping: 0.02
+  enableSelfCollision: 1
+  particleRadius: 0.025
+  youngsModulus: 50000
+  poissonsRatio: 0.45
+  enableFloorCollision: 1
+  floorY: 0
+  drawTetWireframe: 0
+--- !u!23 &1035859554
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1035859551}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 2100000, guid: 99154c8a08863bf46abccf738404f17c, type: 2}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1035859555
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1035859551}
+  m_Mesh: {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!4 &1035859556
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1035859551}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 6.222498, y: 5.08, z: -2.161963}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -743,5 +878,6 @@ SceneRoots:
   - {fileID: 1402724842}
   - {fileID: 287044201}
   - {fileID: 907848980}
+  - {fileID: 1035859556}
   - {fileID: 1000514215}
   - {fileID: 177101811}
