@@ -7,14 +7,14 @@ struct GPUTet
     int v2;
     int v3;
 };
+
 StructuredBuffer<GPUTet> _TetBuffer;
 StructuredBuffer<float3> _PhysPosBuffer;
 StructuredBuffer<int> _CustomTetIndices;
 StructuredBuffer<float4> _CustomBaryWeights;
 RWStructuredBuffer<float3> _DeformedVertices;
+
 int numVertices;
-uniform float4x4 _WorldToLocal;
-uniform uint _VertexCount;
 
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)

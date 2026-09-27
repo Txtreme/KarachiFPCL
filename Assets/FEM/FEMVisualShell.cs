@@ -1,11 +1,10 @@
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
 using UnityEngine;
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class FEMVisualShell : MonoBehaviour
 {
-    [StructLayout(LayoutKind.Sequential)]
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private struct GPUTet
     {
         public int v0, v1, v2, v3;
@@ -34,6 +33,7 @@ public class FEMVisualShell : MonoBehaviour
     // Source Data
     private Vector3[] customSourceVertices;
     private Vector3[] deformedVertices;
+    private Vector3[] localVerts; // Cached to eliminate per-frame GC allocations
     private int[] customTetIndices;
     private Vector4[] customBaryWeights;
 
@@ -71,8 +71,12 @@ public class FEMVisualShell : MonoBehaviour
 
             outputVertsBuffer.GetData(deformedVertices);
 
-            // Convert world-space positions to local space to prevent transform offset duplication
-            Vector3[] localVerts = new Vector3[deformedVertices.Length];
+            // Reallocate cached localVerts array only when vertex count changes
+            if (localVerts == null || localVerts.Length != deformedVertices.Length)
+            {
+                localVerts = new Vector3[deformedVertices.Length];
+            }
+
             Matrix4x4 worldToLocal = transform.worldToLocalMatrix;
             for (int i = 0; i < deformedVertices.Length; i++)
             {
@@ -186,7 +190,6 @@ public class FEMVisualShell : MonoBehaviour
                         foreach (int t in candidateTets)
                         {
                             var tet = tetMesh.tets[t];
-
                             Vector3 x0 = physicsBody.CurrentPositions[tet.v0];
                             Vector3 x1 = physicsBody.CurrentPositions[tet.v1];
                             Vector3 x2 = physicsBody.CurrentPositions[tet.v2];
@@ -217,7 +220,43 @@ public class FEMVisualShell : MonoBehaviour
                 }
             }
 
+            // Global fallback search if local spatial grid lookup yielded no candidates
             if (bestTetIdx == -1 && tetMesh.tets.Count > 0)
+            {
+                for (int t = 0; t < tetMesh.tets.Count; t++)
+                {
+                    var tet = tetMesh.tets[t];
+                    if (!tet.active) continue;
+
+                    Vector3 x0 = physicsBody.CurrentPositions[tet.v0];
+                    Vector3 x1 = physicsBody.CurrentPositions[tet.v1];
+                    Vector3 x2 = physicsBody.CurrentPositions[tet.v2];
+                    Vector3 x3 = physicsBody.CurrentPositions[tet.v3];
+
+                    Vector3 tetCenter = (x0 + x1 + x2 + x3) * 0.25f;
+                    float dist = (worldVPos - tetCenter).sqrMagnitude;
+
+                    if (dist < minDistance)
+                    {
+                        FEMMatrix3x3 Dm = new FEMMatrix3x3(x1 - x0, x2 - x0, x3 - x0);
+                        FEMMatrix3x3 invDm = Dm.Inverse();
+
+                        Vector3 diff = worldVPos - x0;
+                        Vector3 abg = invDm.MultiplyVector(diff);
+
+                        float w1 = abg.x;
+                        float w2 = abg.y;
+                        float w3 = abg.z;
+                        float w0 = 1.0f - (w1 + w2 + w3);
+
+                        minDistance = dist;
+                        bestTetIdx = t;
+                        bestWeights = new Vector4(w0, w1, w2, w3);
+                    }
+                }
+            }
+
+            if (bestTetIdx == -1)
             {
                 bestTetIdx = 0;
                 bestWeights = new Vector4(0.25f, 0.25f, 0.25f, 0.25f);
@@ -238,15 +277,15 @@ public class FEMVisualShell : MonoBehaviour
         if (physicsBody == null || physicsBody.TetMesh == null) return;
 
         List<int> surfaceTris = physicsBody.TetMesh.ReconstructSurfaceTriangles();
-        Vector3[] localVerts = new Vector3[physicsBody.CurrentPositions.Length];
+        Vector3[] localPositions = new Vector3[physicsBody.CurrentPositions.Length];
 
         for (int i = 0; i < physicsBody.CurrentPositions.Length; i++)
         {
-            localVerts[i] = transform.InverseTransformPoint(physicsBody.CurrentPositions[i]);
+            localPositions[i] = transform.InverseTransformPoint(physicsBody.CurrentPositions[i]);
         }
 
         shellMesh.Clear();
-        shellMesh.vertices = localVerts;
+        shellMesh.vertices = localPositions;
         shellMesh.triangles = surfaceTris.ToArray();
         shellMesh.RecalculateNormals();
         shellMesh.RecalculateBounds();
@@ -283,7 +322,6 @@ public class FEMVisualShell : MonoBehaviour
 
         kernelCSMain = skinningComputeShader.FindKernel("CSMain");
 
-        // Updated buffer names to match HLSL property names
         skinningComputeShader.SetBuffer(kernelCSMain, "_TetBuffer", tetBuffer);
         skinningComputeShader.SetBuffer(kernelCSMain, "_PhysPosBuffer", physPosBuffer);
         skinningComputeShader.SetBuffer(kernelCSMain, "_CustomTetIndices", tetIdxBuffer);

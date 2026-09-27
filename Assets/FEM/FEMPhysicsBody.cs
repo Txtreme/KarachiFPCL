@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using static TetrahedralMesh;
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class FEMPhysicsBody : MonoBehaviour
@@ -341,70 +342,6 @@ public class FEMPhysicsBody : MonoBehaviour
         }
     }
 
-    public void NotifyMeshCut()
-    {
-        CleanupDanglingTetrahedra();
-        PrecomputeRestMatrices();
-        InitializeGPUResources();
-
-        if (GetComponent<FEMVisualShell>() == null)
-        {
-            UpdateVisualMesh();
-        }
-
-        UpdateColliderMesh();
-
-        FEMVisualShell visualShell = GetComponent<FEMVisualShell>();
-        if (visualShell != null)
-        {
-            visualShell.OnMeshCut();
-        }
-    }
-
-    public void CleanupDanglingTetrahedra()
-    {
-        if (tetMesh == null || tetMesh.tets == null) return;
-
-        int maxPasses = 3;
-        for (int pass = 0; pass < maxPasses; pass++)
-        {
-            bool removedInPass = false;
-
-            Dictionary<int, int> vertTetCounts = new Dictionary<int, int>();
-            for (int i = 0; i < tetMesh.tets.Count; i++)
-            {
-                var tet = tetMesh.tets[i];
-                if (!tet.active) continue;
-
-                vertTetCounts[tet.v0] = vertTetCounts.GetValueOrDefault(tet.v0, 0) + 1;
-                vertTetCounts[tet.v1] = vertTetCounts.GetValueOrDefault(tet.v1, 0) + 1;
-                vertTetCounts[tet.v2] = vertTetCounts.GetValueOrDefault(tet.v2, 0) + 1;
-                vertTetCounts[tet.v3] = vertTetCounts.GetValueOrDefault(tet.v3, 0) + 1;
-            }
-
-            for (int i = 0; i < tetMesh.tets.Count; i++)
-            {
-                var tet = tetMesh.tets[i];
-                if (!tet.active) continue;
-
-                int lonelyVerts = 0;
-                if (vertTetCounts.GetValueOrDefault(tet.v0, 0) == 1) lonelyVerts++;
-                if (vertTetCounts.GetValueOrDefault(tet.v1, 0) == 1) lonelyVerts++;
-                if (vertTetCounts.GetValueOrDefault(tet.v2, 0) == 1) lonelyVerts++;
-                if (vertTetCounts.GetValueOrDefault(tet.v3, 0) == 1) lonelyVerts++;
-
-                if (lonelyVerts >= 2)
-                {
-                    tet.active = false;
-                    tetMesh.tets[i] = tet;
-                    removedInPass = true;
-                }
-            }
-
-            if (!removedInPass) break;
-        }
-    }
-
     private void UpdateVisualMesh()
     {
         MeshFilter mf = GetComponent<MeshFilter>();
@@ -503,6 +440,250 @@ public class FEMPhysicsBody : MonoBehaviour
             Gizmos.DrawLine(positions[tet.v1], positions[tet.v2]);
             Gizmos.DrawLine(positions[tet.v1], positions[tet.v3]);
             Gizmos.DrawLine(positions[tet.v2], positions[tet.v3]);
+        }
+    }
+
+    // ==========================================
+    // CUTTING & CHUNK SEPARATION LOGIC
+    // ==========================================
+
+    /// <summary>
+    /// Call this method whenever a cutting operation deactivates tetrahedra.
+    /// It cleans up orphaned elements, detects disconnected mesh islands,
+    /// and instantiates isolated pieces into independent physics GameObjects.
+    /// </summary>
+    public void OnMeshCut() => NotifyMeshCut();
+
+    public void NotifyMeshCut()
+    {
+        CleanupDanglingTetrahedra();
+
+        List<List<int>> islands = FindConnectedIslands();
+
+        if (islands.Count > 1)
+        {
+            // Update current body with Island 0
+            this.tetMesh = CreateSubTetMesh(islands[0], out List<Vector3> island0Positions);
+            ReinitializeBody(island0Positions);
+
+            // Spawn separate GameObjects for Islands 1..N
+            for (int i = 1; i < islands.Count; i++)
+            {
+                TetrahedralMesh chunkMesh = CreateSubTetMesh(islands[i], out List<Vector3> chunkPositions);
+                SpawnChunkGameObject(chunkMesh, chunkPositions);
+            }
+        }
+        else
+        {
+            ReinitializeBody();
+        }
+
+        FEMVisualShell visualShell = GetComponent<FEMVisualShell>();
+        if (visualShell != null)
+        {
+            visualShell.OnMeshCut();
+        }
+    }
+
+    private List<List<int>> FindConnectedIslands()
+    {
+        List<List<int>> islands = new List<List<int>>();
+        if (tetMesh == null || tetMesh.tets == null) return islands;
+
+        bool[] visited = new bool[tetMesh.tets.Count];
+
+        // Build vertex-to-tetrahedra lookup map
+        Dictionary<int, List<int>> vertToTets = new Dictionary<int, List<int>>();
+        for (int i = 0; i < tetMesh.tets.Count; i++)
+        {
+            var tet = tetMesh.tets[i];
+            if (!tet.active) continue;
+
+            int[] vList = { tet.v0, tet.v1, tet.v2, tet.v3 };
+            foreach (int v in vList)
+            {
+                if (!vertToTets.TryGetValue(v, out var list))
+                {
+                    list = new List<int>();
+                    vertToTets[v] = list;
+                }
+                list.Add(i);
+            }
+        }
+
+        // Breadth-first search for connected components
+        for (int i = 0; i < tetMesh.tets.Count; i++)
+        {
+            if (visited[i] || !tetMesh.tets[i].active) continue;
+
+            List<int> currentIsland = new List<int>();
+            Queue<int> queue = new Queue<int>();
+
+            queue.Enqueue(i);
+            visited[i] = true;
+
+            while (queue.Count > 0)
+            {
+                int curr = queue.Dequeue();
+                currentIsland.Add(curr);
+
+                var tet = tetMesh.tets[curr];
+                int[] vList = { tet.v0, tet.v1, tet.v2, tet.v3 };
+
+                foreach (int v in vList)
+                {
+                    if (vertToTets.TryGetValue(v, out var neighbors))
+                    {
+                        foreach (int n in neighbors)
+                        {
+                            if (!visited[n] && tetMesh.tets[n].active)
+                            {
+                                visited[n] = true;
+                                queue.Enqueue(n);
+                            }
+                        }
+                    }
+                }
+            }
+            islands.Add(currentIsland);
+        }
+
+        return islands;
+    }
+
+    private TetrahedralMesh CreateSubTetMesh(List<int> islandTetIndices, out List<Vector3> extractedPositions)
+    {
+        TetrahedralMesh subMesh = new TetrahedralMesh
+        {
+            vertices = new List<Vector3>(),
+            tets = new List<Tetrahedron>()
+        };
+
+        List<Vector3> positionsList = new List<Vector3>();
+        Dictionary<int, int> oldToNewVertMap = new Dictionary<int, int>();
+
+        int GetMappedVertex(int oldIdx)
+        {
+            if (oldToNewVertMap.TryGetValue(oldIdx, out int newIdx))
+                return newIdx;
+
+            newIdx = subMesh.vertices.Count;
+            subMesh.vertices.Add(tetMesh.vertices[oldIdx]);
+            positionsList.Add(positions[oldIdx]);
+            oldToNewVertMap[oldIdx] = newIdx;
+            return newIdx;
+        }
+
+        foreach (int tetIdx in islandTetIndices)
+        {
+            Tetrahedron oldTet = tetMesh.tets[tetIdx];
+            if (!oldTet.active) continue;
+
+            int nv0 = GetMappedVertex(oldTet.v0);
+            int nv1 = GetMappedVertex(oldTet.v1);
+            int nv2 = GetMappedVertex(oldTet.v2);
+            int nv3 = GetMappedVertex(oldTet.v3);
+
+            Tetrahedron newTet = new Tetrahedron(nv0, nv1, nv2, nv3)
+            {
+                restVolume = oldTet.restVolume,
+                active = true
+            };
+
+            subMesh.tets.Add(newTet);
+        }
+
+        extractedPositions = positionsList;
+        return subMesh;
+    }
+
+    private void SpawnChunkGameObject(TetrahedralMesh chunkMesh, List<Vector3> chunkPositions)
+    {
+        GameObject chunkGO = new GameObject(gameObject.name + "_Piece");
+        chunkGO.transform.position = transform.position;
+        chunkGO.transform.rotation = transform.rotation;
+        chunkGO.transform.localScale = transform.localScale;
+
+        MeshFilter mf = chunkGO.AddComponent<MeshFilter>();
+        MeshRenderer mr = chunkGO.AddComponent<MeshRenderer>();
+        MeshRenderer myRenderer = GetComponent<MeshRenderer>();
+        if (myRenderer != null) mr.sharedMaterials = myRenderer.sharedMaterials;
+
+        FEMPhysicsBody newBody = chunkGO.AddComponent<FEMPhysicsBody>();
+        newBody.sourceMesh = this.sourceMesh;
+        newBody.femComputeShader = this.femComputeShader;
+        newBody.youngsModulus = this.youngsModulus;
+        newBody.poissonsRatio = this.poissonsRatio;
+        newBody.solverSubsteps = this.solverSubsteps;
+        newBody.particleMass = this.particleMass;
+        newBody.damping = this.damping;
+        newBody.gravity = this.gravity;
+        newBody.enableFloorCollision = this.enableFloorCollision;
+        newBody.floorY = this.floorY;
+
+        MeshCollider mc = chunkGO.AddComponent<MeshCollider>();
+        mc.convex = true;
+
+        newBody.tetMesh = chunkMesh;
+        newBody.InitializePhysicsState(chunkPositions);
+    }
+
+    private void ReinitializeBody(List<Vector3> customWorldPositions = null)
+    {
+        if (customWorldPositions != null)
+        {
+            InitializePhysicsState(customWorldPositions);
+        }
+        else
+        {
+            PrecomputeRestMatrices();
+            InitializeGPUResources();
+            UpdateVisualMesh();
+            UpdateColliderMesh();
+        }
+    }
+
+    public void CleanupDanglingTetrahedra()
+    {
+        if (tetMesh == null || tetMesh.tets == null) return;
+
+        int maxPasses = 3;
+        for (int pass = 0; pass < maxPasses; pass++)
+        {
+            bool removedInPass = false;
+
+            Dictionary<int, int> vertTetCounts = new Dictionary<int, int>();
+            for (int i = 0; i < tetMesh.tets.Count; i++)
+            {
+                var tet = tetMesh.tets[i];
+                if (!tet.active) continue;
+
+                vertTetCounts[tet.v0] = vertTetCounts.TryGetValue(tet.v0, out int c0) ? c0 + 1 : 1;
+                vertTetCounts[tet.v1] = vertTetCounts.TryGetValue(tet.v1, out int c1) ? c1 + 1 : 1;
+                vertTetCounts[tet.v2] = vertTetCounts.TryGetValue(tet.v2, out int c2) ? c2 + 1 : 1;
+                vertTetCounts[tet.v3] = vertTetCounts.TryGetValue(tet.v3, out int c3) ? c3 + 1 : 1;
+            }
+
+            for (int i = 0; i < tetMesh.tets.Count; i++)
+            {
+                var tet = tetMesh.tets[i];
+                if (!tet.active) continue;
+
+                int lonelyVerts = 0;
+                if ((vertTetCounts.TryGetValue(tet.v0, out int count0) ? count0 : 0) == 1) lonelyVerts++;
+                if ((vertTetCounts.TryGetValue(tet.v1, out int count1) ? count1 : 0) == 1) lonelyVerts++;
+                if ((vertTetCounts.TryGetValue(tet.v2, out int count2) ? count2 : 0) == 1) lonelyVerts++;
+                if ((vertTetCounts.TryGetValue(tet.v3, out int count3) ? count3 : 0) == 1) lonelyVerts++;
+
+                if (lonelyVerts >= 2)
+                {
+                    tet.active = false;
+                    tetMesh.tets[i] = tet;
+                    removedInPass = true;
+                }
+            }
+
+            if (!removedInPass) break;
         }
     }
 }

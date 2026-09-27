@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 public class MeshCutter : MonoBehaviour
@@ -13,7 +14,7 @@ public class MeshCutter : MonoBehaviour
     public CutMode cutMode = CutMode.BoxCollider;
 
     [Header("Continuous Cutting")]
-    public bool cutOnTrigger = true;
+    public bool cutOnTrigger = false; // Set to false so Box and Mesh cuts run continuously in Update
 
     [Header("Thickness / Margin Tuning")]
     public float bladeThicknessMargin = 0.05f;
@@ -36,11 +37,14 @@ public class MeshCutter : MonoBehaviour
     private void Start()
     {
         prevPosition = transform.position;
+        if (targetBoxCollider == null) targetBoxCollider = GetComponent<BoxCollider>();
+        if (targetMeshCollider == null) targetMeshCollider = GetComponent<MeshCollider>();
     }
 
     private void Update()
     {
         Vector3 currentPosition = transform.position;
+        float movementSqr = (currentPosition - prevPosition).sqrMagnitude;
 
         if (cutMode == CutMode.PlaneSweep)
         {
@@ -56,7 +60,7 @@ public class MeshCutter : MonoBehaviour
                 PerformPlaneSweepCut(prevPosition, currentPosition, sweepNorm, sweepLength, planeNormal);
             }
         }
-        else if (!cutOnTrigger)
+        else if (!cutOnTrigger && movementSqr > 0.00001f) // Execute volume cut only when cutter moved
         {
             PerformVolumeCut();
         }
@@ -190,8 +194,26 @@ public class MeshCutter : MonoBehaviour
     private bool IsPointInsideMesh(Vector3 worldPoint, MeshCollider meshCol)
     {
         if (!meshCol.bounds.Contains(worldPoint)) return false;
-        Vector3 closest = meshCol.ClosestPoint(worldPoint);
-        return (closest - worldPoint).sqrMagnitude < 1e-4f;
+
+        // Directional raycast from outside the bounding box toward the point
+        Vector3 start = meshCol.bounds.min - new Vector3(1f, 1f, 1f);
+        Vector3 dir = worldPoint - start;
+        float dist = dir.magnitude;
+        if (dist < 0.0001f) return false;
+        dir /= dist;
+
+        RaycastHit[] hits = Physics.RaycastAll(start, dir, dist);
+        int hitCount = 0;
+        for (int i = 0; i < hits.Length; i++)
+        {
+            if (hits[i].collider == meshCol)
+            {
+                hitCount++;
+            }
+        }
+
+        // An odd number of surface intersections indicates the point is inside the closed mesh
+        return (hitCount % 2) == 1;
     }
 
     public void PerformPlaneSweepCut(Vector3 startPt, Vector3 endPt, Vector3 sweepNorm, float sweepLength, Vector3 planeNormal)
