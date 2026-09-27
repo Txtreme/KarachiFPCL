@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
@@ -58,6 +59,7 @@ public class FEMPhysicsBody : MonoBehaviour
         public int active;
     }
 
+    [System.Serializable]
     public struct GPUMatrix3x3
     {
         public float m00, m01, m02;
@@ -72,7 +74,6 @@ public class FEMPhysicsBody : MonoBehaviour
     {
         EnsureComponentsExist();
 
-        // Cache the original 3D source mesh before FEMVisualShell replaces MeshFilter.mesh
         if (sourceMesh == null)
         {
             MeshFilter mf = GetComponent<MeshFilter>();
@@ -159,7 +160,6 @@ public class FEMPhysicsBody : MonoBehaviour
         PrecomputeRestMatrices();
         InitializeGPUResources();
 
-        // Skip default visual mesh initialization if FEMVisualShell is attached
         if (GetComponent<FEMVisualShell>() == null)
         {
             Mesh visualMesh = new Mesh();
@@ -178,6 +178,7 @@ public class FEMPhysicsBody : MonoBehaviour
         for (int t = 0; t < tetMesh.tets.Count; t++)
         {
             var tet = tetMesh.tets[t];
+
             Vector3 X0 = tetMesh.vertices[tet.v0];
             Vector3 X1 = tetMesh.vertices[tet.v1];
             Vector3 X2 = tetMesh.vertices[tet.v2];
@@ -187,13 +188,26 @@ public class FEMPhysicsBody : MonoBehaviour
             Vector3 Dm1 = X2 - X0;
             Vector3 Dm2 = X3 - X0;
 
-            Matrix3x3 Dm = new Matrix3x3(Dm0, Dm1, Dm2);
+            FEMMatrix3x3 Dm = new FEMMatrix3x3(Dm0, Dm1, Dm2);
             float det = Dm.Determinant();
 
-            tet.restVolume = Mathf.Max(Mathf.Abs(det) / 6.0f, 1e-6f);
+            if (det < 0)
+            {
+                int temp = tet.v1;
+                tet.v1 = tet.v2;
+                tet.v2 = temp;
+
+                Dm0 = tetMesh.vertices[tet.v1] - X0;
+                Dm1 = tetMesh.vertices[tet.v2] - X0;
+                Dm = new FEMMatrix3x3(Dm0, Dm1, Dm2);
+                det = Dm.Determinant();
+            }
+
+            tet.restVolume = Mathf.Max(det / 6.0f, 1e-6f);
             tetMesh.tets[t] = tet;
 
-            Matrix3x3 invDm = (Mathf.Abs(det) > 1e-7f) ? Dm.Inverse() : Matrix3x3.Identity;
+            FEMMatrix3x3 invDm = (Mathf.Abs(det) > 1e-7f) ? Dm.Inverse() : FEMMatrix3x3.Identity;
+
             invRestMatrices[t] = new GPUMatrix3x3
             {
                 m00 = invDm.m00,
@@ -253,9 +267,8 @@ public class FEMPhysicsBody : MonoBehaviour
             };
         }
 
-        tetsBuffer = new ComputeBuffer(numTets, sizeof(int) * 5 + sizeof(float));
-        invRestMatricesBuffer = new ComputeBuffer(numTets, sizeof(float) * 9);
-
+        tetsBuffer = new ComputeBuffer(numTets, Marshal.SizeOf<GPUTetrahedron>());
+        invRestMatricesBuffer = new ComputeBuffer(numTets, Marshal.SizeOf<GPUMatrix3x3>());
         deltaPosIntBuffer = new ComputeBuffer(numVerts, sizeof(int) * 3);
         deltaCountBuffer = new ComputeBuffer(numVerts, sizeof(int));
 
@@ -322,7 +335,6 @@ public class FEMPhysicsBody : MonoBehaviour
 
         positionsBuffer.GetData(positions);
 
-        // Skip default visual mesh updates if FEMVisualShell is handling visualization
         if (GetComponent<FEMVisualShell>() == null)
         {
             UpdateVisualMesh();
@@ -331,6 +343,7 @@ public class FEMPhysicsBody : MonoBehaviour
 
     public void NotifyMeshCut()
     {
+        CleanupDanglingTetrahedra();
         PrecomputeRestMatrices();
         InitializeGPUResources();
 
@@ -345,6 +358,50 @@ public class FEMPhysicsBody : MonoBehaviour
         if (visualShell != null)
         {
             visualShell.OnMeshCut();
+        }
+    }
+
+    public void CleanupDanglingTetrahedra()
+    {
+        if (tetMesh == null || tetMesh.tets == null) return;
+
+        int maxPasses = 3;
+        for (int pass = 0; pass < maxPasses; pass++)
+        {
+            bool removedInPass = false;
+
+            Dictionary<int, int> vertTetCounts = new Dictionary<int, int>();
+            for (int i = 0; i < tetMesh.tets.Count; i++)
+            {
+                var tet = tetMesh.tets[i];
+                if (!tet.active) continue;
+
+                vertTetCounts[tet.v0] = vertTetCounts.GetValueOrDefault(tet.v0, 0) + 1;
+                vertTetCounts[tet.v1] = vertTetCounts.GetValueOrDefault(tet.v1, 0) + 1;
+                vertTetCounts[tet.v2] = vertTetCounts.GetValueOrDefault(tet.v2, 0) + 1;
+                vertTetCounts[tet.v3] = vertTetCounts.GetValueOrDefault(tet.v3, 0) + 1;
+            }
+
+            for (int i = 0; i < tetMesh.tets.Count; i++)
+            {
+                var tet = tetMesh.tets[i];
+                if (!tet.active) continue;
+
+                int lonelyVerts = 0;
+                if (vertTetCounts.GetValueOrDefault(tet.v0, 0) == 1) lonelyVerts++;
+                if (vertTetCounts.GetValueOrDefault(tet.v1, 0) == 1) lonelyVerts++;
+                if (vertTetCounts.GetValueOrDefault(tet.v2, 0) == 1) lonelyVerts++;
+                if (vertTetCounts.GetValueOrDefault(tet.v3, 0) == 1) lonelyVerts++;
+
+                if (lonelyVerts >= 2)
+                {
+                    tet.active = false;
+                    tetMesh.tets[i] = tet;
+                    removedInPass = true;
+                }
+            }
+
+            if (!removedInPass) break;
         }
     }
 
@@ -447,58 +504,5 @@ public class FEMPhysicsBody : MonoBehaviour
             Gizmos.DrawLine(positions[tet.v1], positions[tet.v3]);
             Gizmos.DrawLine(positions[tet.v2], positions[tet.v3]);
         }
-    }
-}
-
-public struct Matrix3x3
-{
-    public float m00, m01, m02;
-    public float m10, m11, m12;
-    public float m20, m21, m22;
-
-    public static Matrix3x3 Identity => new Matrix3x3(new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1));
-
-    public Matrix3x3(Vector3 col0, Vector3 col1, Vector3 col2)
-    {
-        m00 = col0.x; m10 = col0.y; m20 = col0.z;
-        m01 = col1.x; m11 = col1.y; m21 = col1.z;
-        m02 = col2.x; m12 = col2.y; m22 = col2.z;
-    }
-
-    public Vector3 MultiplyVector(Vector3 v)
-    {
-        return new Vector3(
-            m00 * v.x + m01 * v.y + m02 * v.z,
-            m10 * v.x + m11 * v.y + m12 * v.z,
-            m20 * v.x + m21 * v.y + m22 * v.z
-        );
-    }
-
-    public float Determinant()
-    {
-        return m00 * (m11 * m22 - m12 * m21)
-             - m01 * (m10 * m22 - m12 * m20)
-             + m02 * (m10 * m21 - m11 * m20);
-    }
-
-    public Matrix3x3 Inverse()
-    {
-        float det = Determinant();
-        if (Mathf.Abs(det) < 1e-7f) return Identity;
-
-        float invDet = 1.0f / det;
-        Matrix3x3 r;
-        r.m00 = (m11 * m22 - m12 * m21) * invDet;
-        r.m01 = (m02 * m21 - m01 * m22) * invDet;
-        r.m02 = (m01 * m12 - m02 * m11) * invDet;
-
-        r.m10 = (m12 * m20 - m10 * m22) * invDet;
-        r.m11 = (m00 * m22 - m02 * m20) * invDet;
-        r.m12 = (m02 * m10 - m00 * m12) * invDet;
-
-        r.m20 = (m10 * m21 - m11 * m20) * invDet;
-        r.m21 = (m01 * m20 - m00 * m21) * invDet;
-        r.m22 = (m00 * m11 - m01 * m10) * invDet;
-        return r;
     }
 }

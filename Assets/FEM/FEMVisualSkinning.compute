@@ -1,0 +1,36 @@
+#pragma kernel CSMain
+
+struct GPUTet
+{
+    int v0;
+    int v1;
+    int v2;
+    int v3;
+};
+StructuredBuffer<GPUTet> _TetBuffer;
+StructuredBuffer<float3> _PhysPosBuffer;
+StructuredBuffer<int> _CustomTetIndices;
+StructuredBuffer<float4> _CustomBaryWeights;
+RWStructuredBuffer<float3> _DeformedVertices;
+int numVertices;
+uniform float4x4 _WorldToLocal;
+uniform uint _VertexCount;
+
+[numthreads(64, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= (uint) numVertices)
+        return;
+
+    int tetIdx = _CustomTetIndices[idx];
+    GPUTet tet = _TetBuffer[tetIdx];
+    float4 w = _CustomBaryWeights[idx];
+
+    float3 p0 = _PhysPosBuffer[tet.v0];
+    float3 p1 = _PhysPosBuffer[tet.v1];
+    float3 p2 = _PhysPosBuffer[tet.v2];
+    float3 p3 = _PhysPosBuffer[tet.v3];
+
+    _DeformedVertices[idx] = p0 * w.x + p1 * w.y + p2 * w.z + p3 * w.w;
+}

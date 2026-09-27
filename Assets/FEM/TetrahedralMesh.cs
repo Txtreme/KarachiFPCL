@@ -1,182 +1,219 @@
-using System;
 using System.Collections.Generic;
 using UnityEngine;
+
+[System.Serializable]
+public struct Tetrahedron
+{
+    public int v0, v1, v2, v3;
+    public float restVolume;
+    public bool active;
+
+    public Tetrahedron(int v0, int v1, int v2, int v3)
+    {
+        this.v0 = v0;
+        this.v1 = v1;
+        this.v2 = v2;
+        this.v3 = v3;
+        this.restVolume = 0f;
+        this.active = true;
+    }
+}
 
 public class TetrahedralMesh
 {
     public List<Vector3> vertices = new List<Vector3>();
     public List<Tetrahedron> tets = new List<Tetrahedron>();
 
-    public struct Tetrahedron
-    {
-        public int v0, v1, v2, v3;
-        public float restVolume;
-        public bool active;
-
-        public Tetrahedron(int v0, int v1, int v2, int v3, float restVolume)
-        {
-            this.v0 = v0;
-            this.v1 = v1;
-            this.v2 = v2;
-            this.v3 = v3;
-            this.restVolume = restVolume;
-            this.active = true;
-        }
-    }
-
-    public struct FaceKey : IEquatable<FaceKey>
-    {
-        public readonly int a, b, c;
-
-        public FaceKey(int v0, int v1, int v2)
-        {
-            int[] idx = { v0, v1, v2 };
-            Array.Sort(idx);
-            a = idx[0];
-            b = idx[1];
-            c = idx[2];
-        }
-
-        public bool Equals(FaceKey other) => a == other.a && b == other.b && c == other.c;
-        public override bool Equals(object obj) => obj is FaceKey other && Equals(other);
-        public override int GetHashCode() => HashCode.Combine(a, b, c);
-    }
-
-    public static TetrahedralMesh GenerateFromMesh(Mesh sourceMesh, Vector3Int gridRes)
+    public static TetrahedralMesh GenerateFromMesh(Mesh mesh, Vector3Int gridRes)
     {
         TetrahedralMesh tetMesh = new TetrahedralMesh();
-        Bounds bounds = sourceMesh.bounds;
-        Vector3 min = bounds.min;
-        Vector3 size = bounds.size;
-        Vector3 cellSize = new Vector3(size.x / gridRes.x, size.y / gridRes.y, size.z / gridRes.z);
+        if (mesh == null) return tetMesh;
 
-        Vector3[] srcVerts = sourceMesh.vertices;
-        int[] srcTris = sourceMesh.triangles;
+        Vector3[] origVerts = mesh.vertices;
+        int[] origTris = mesh.triangles;
+        if (origVerts.Length == 0 || origTris.Length == 0) return tetMesh;
 
-        Dictionary<Vector3Int, int> nodeMap = new Dictionary<Vector3Int, int>();
+        Bounds bounds = mesh.bounds;
+        bounds.Expand(0.01f);
 
-        int GetOrAddVertex(Vector3Int gridPos)
+        int nx = Mathf.Max(2, gridRes.x);
+        int ny = Mathf.Max(2, gridRes.y);
+        int nz = Mathf.Max(2, gridRes.z);
+
+        Vector3 step = new Vector3(
+            bounds.size.x / (nx - 1),
+            bounds.size.y / (ny - 1),
+            bounds.size.z / (nz - 1)
+        );
+
+        Vector3[,,] gridVerts = new Vector3[nx, ny, nz];
+        for (int x = 0; x < nx; x++)
         {
-            if (nodeMap.TryGetValue(gridPos, out int index)) return index;
-
-            Vector3 worldPos = min + new Vector3(gridPos.x * cellSize.x, gridPos.y * cellSize.y, gridPos.z * cellSize.z);
-            tetMesh.vertices.Add(worldPos);
-            index = tetMesh.vertices.Count - 1;
-            nodeMap[gridPos] = index;
-            return index;
+            for (int y = 0; y < ny; y++)
+            {
+                for (int z = 0; z < nz; z++)
+                {
+                    gridVerts[x, y, z] = bounds.min + new Vector3(x * step.x, y * step.y, z * step.z);
+                }
+            }
         }
 
-        for (int x = 0; x < gridRes.x; x++)
+        Dictionary<Vector3Int, int> gridToCompactIndex = new Dictionary<Vector3Int, int>();
+
+        int GetOrAddVertex(Vector3Int cell)
         {
-            for (int y = 0; y < gridRes.y; y++)
+            if (gridToCompactIndex.TryGetValue(cell, out int idx)) return idx;
+            idx = tetMesh.vertices.Count;
+            tetMesh.vertices.Add(gridVerts[cell.x, cell.y, cell.z]);
+            gridToCompactIndex[cell] = idx;
+            return idx;
+        }
+
+        for (int x = 0; x < nx - 1; x++)
+        {
+            for (int y = 0; y < ny - 1; y++)
             {
-                for (int z = 0; z < gridRes.z; z++)
+                for (int z = 0; z < nz - 1; z++)
                 {
-                    Vector3Int p000 = new Vector3Int(x, y, z);
-                    Vector3Int p100 = new Vector3Int(x + 1, y, z);
-                    Vector3Int p010 = new Vector3Int(x, y + 1, z);
-                    Vector3Int p110 = new Vector3Int(x + 1, y + 1, z);
-                    Vector3Int p001 = new Vector3Int(x, y, z + 1);
-                    Vector3Int p101 = new Vector3Int(x + 1, y, z + 1);
-                    Vector3Int p011 = new Vector3Int(x, y + 1, z + 1);
-                    Vector3Int p111 = new Vector3Int(x + 1, y + 1, z + 1);
+                    Vector3Int c0 = new Vector3Int(x, y, z);
+                    Vector3Int c1 = new Vector3Int(x + 1, y, z);
+                    Vector3Int c2 = new Vector3Int(x + 1, y + 1, z);
+                    Vector3Int c3 = new Vector3Int(x, y + 1, z);
+                    Vector3Int c4 = new Vector3Int(x, y, z + 1);
+                    Vector3Int c5 = new Vector3Int(x + 1, y, z + 1);
+                    Vector3Int c6 = new Vector3Int(x + 1, y + 1, z + 1);
+                    Vector3Int c7 = new Vector3Int(x, y + 1, z + 1);
 
-                    Vector3Int[][] cellTets = new Vector3Int[][]
+                    Vector3Int[][] cellTetsPattern;
+
+                    if ((x + y + z) % 2 == 0)
                     {
-                        new Vector3Int[] { p000, p100, p010, p001 },
-                        new Vector3Int[] { p100, p110, p010, p111 },
-                        new Vector3Int[] { p100, p001, p010, p101 },
-                        new Vector3Int[] { p010, p001, p111, p011 },
-                        new Vector3Int[] { p100, p010, p111, p001 }
-                    };
-
-                    foreach (var rawTet in cellTets)
-                    {
-                        int v0 = GetOrAddVertex(rawTet[0]);
-                        int v1 = GetOrAddVertex(rawTet[1]);
-                        int v2 = GetOrAddVertex(rawTet[2]);
-                        int v3 = GetOrAddVertex(rawTet[3]);
-
-                        Vector3 center = (tetMesh.vertices[v0] + tetMesh.vertices[v1] + tetMesh.vertices[v2] + tetMesh.vertices[v3]) * 0.25f;
-
-                        if (IsPointInsideMesh(center, srcVerts, srcTris))
+                        cellTetsPattern = new Vector3Int[][]
                         {
-                            float vol = CalculateSignedVolume(tetMesh.vertices[v0], tetMesh.vertices[v1], tetMesh.vertices[v2], tetMesh.vertices[v3]);
-                            if (vol < 0) { int tmp = v1; v1 = v2; v2 = tmp; vol = -vol; }
-                            if (vol > 1e-5f)
-                            {
-                                tetMesh.tets.Add(new Tetrahedron(v0, v1, v2, v3, vol));
-                            }
+                            new Vector3Int[] { c0, c1, c3, c4 },
+                            new Vector3Int[] { c1, c2, c3, c6 },
+                            new Vector3Int[] { c1, c4, c5, c6 },
+                            new Vector3Int[] { c3, c4, c6, c7 },
+                            new Vector3Int[] { c1, c3, c4, c6 }
+                        };
+                    }
+                    else
+                    {
+                        cellTetsPattern = new Vector3Int[][]
+                        {
+                            new Vector3Int[] { c0, c1, c2, c5 },
+                            new Vector3Int[] { c0, c2, c3, c7 },
+                            new Vector3Int[] { c0, c4, c5, c7 },
+                            new Vector3Int[] { c2, c5, c6, c7 },
+                            new Vector3Int[] { c0, c2, c5, c7 }
+                        };
+                    }
+
+                    foreach (var tetPattern in cellTetsPattern)
+                    {
+                        Vector3 p0 = gridVerts[tetPattern[0].x, tetPattern[0].y, tetPattern[0].z];
+                        Vector3 p1 = gridVerts[tetPattern[1].x, tetPattern[1].y, tetPattern[1].z];
+                        Vector3 p2 = gridVerts[tetPattern[2].x, tetPattern[2].y, tetPattern[2].z];
+                        Vector3 p3 = gridVerts[tetPattern[3].x, tetPattern[3].y, tetPattern[3].z];
+
+                        Vector3 centroid = (p0 + p1 + p2 + p3) * 0.25f;
+
+                        if (IsPointInsideMesh(centroid, origVerts, origTris) ||
+                            IsPointInsideMesh(p0, origVerts, origTris) ||
+                            IsPointInsideMesh(p1, origVerts, origTris) ||
+                            IsPointInsideMesh(p2, origVerts, origTris) ||
+                            IsPointInsideMesh(p3, origVerts, origTris))
+                        {
+                            int i0 = GetOrAddVertex(tetPattern[0]);
+                            int i1 = GetOrAddVertex(tetPattern[1]);
+                            int i2 = GetOrAddVertex(tetPattern[2]);
+                            int i3 = GetOrAddVertex(tetPattern[3]);
+
+                            tetMesh.tets.Add(new Tetrahedron(i0, i1, i2, i3));
                         }
                     }
                 }
             }
         }
 
-        tetMesh.ProjectBoundaryVerticesToSurface(srcVerts, srcTris, cellSize.magnitude * 0.5f);
+        // =========================================================================
+        // SMOOTHING STEP: Project all surface boundary vertices to closest mesh point
+        // =========================================================================
+        List<int> surfaceTris = tetMesh.ReconstructSurfaceTriangles();
+        HashSet<int> surfaceVertIndices = new HashSet<int>(surfaceTris);
+
+        foreach (int vIdx in surfaceVertIndices)
+        {
+            tetMesh.vertices[vIdx] = GetClosestPointOnMesh(tetMesh.vertices[vIdx], origVerts, origTris);
+        }
+
         return tetMesh;
     }
 
-    private void ProjectBoundaryVerticesToSurface(Vector3[] srcVerts, int[] srcTris, float maxSnapDist)
+    private static bool IsPointInsideMesh(Vector3 point, Vector3[] verts, int[] tris)
     {
-        List<int> surfaceTriangles = ReconstructSurfaceTriangles();
-        HashSet<int> boundaryVertIndices = new HashSet<int>(surfaceTriangles);
+        Vector3 rayDir = new Vector3(0.408248f, 0.816497f, 0.408248f);
+        int intersections = 0;
 
-        foreach (int vIdx in boundaryVertIndices)
+        for (int i = 0; i < tris.Length; i += 3)
         {
-            Vector3 origPos = vertices[vIdx];
-            Vector3 closestPoint = origPos;
-            float minSqrDist = float.MaxValue;
+            Vector3 v0 = verts[tris[i]];
+            Vector3 v1 = verts[tris[i + 1]];
+            Vector3 v2 = verts[tris[i + 2]];
 
-            for (int i = 0; i < srcTris.Length; i += 3)
+            if (RayTriangleIntersection(point, rayDir, v0, v1, v2))
             {
-                Vector3 a = srcVerts[srcTris[i]];
-                Vector3 b = srcVerts[srcTris[i + 1]];
-                Vector3 c = srcVerts[srcTris[i + 2]];
-
-                Vector3 pt = ClosestPointOnTriangle(origPos, a, b, c);
-                float sqrDist = (pt - origPos).sqrMagnitude;
-
-                if (sqrDist < minSqrDist)
-                {
-                    minSqrDist = sqrDist;
-                    closestPoint = pt;
-                }
-            }
-
-            if (Mathf.Sqrt(minSqrDist) <= maxSnapDist)
-            {
-                Vector3 targetPos = Vector3.Lerp(origPos, closestPoint, 0.7f);
-                vertices[vIdx] = targetPos;
-
-                bool validSnap = true;
-                foreach (var tet in tets)
-                {
-                    if (tet.v0 == vIdx || tet.v1 == vIdx || tet.v2 == vIdx || tet.v3 == vIdx)
-                    {
-                        float vol = CalculateSignedVolume(vertices[tet.v0], vertices[tet.v1], vertices[tet.v2], vertices[tet.v3]);
-                        if (vol <= 1e-5f)
-                        {
-                            validSnap = false;
-                            break;
-                        }
-                    }
-                }
-
-                if (!validSnap)
-                {
-                    vertices[vIdx] = origPos;
-                }
+                intersections++;
             }
         }
 
-        for (int i = 0; i < tets.Count; i++)
+        return (intersections % 2) == 1;
+    }
+
+    private static bool RayTriangleIntersection(Vector3 rayOrigin, Vector3 rayDir, Vector3 v0, Vector3 v1, Vector3 v2)
+    {
+        const float EPSILON = 1e-7f;
+        Vector3 edge1 = v1 - v0;
+        Vector3 edge2 = v2 - v0;
+        Vector3 h = Vector3.Cross(rayDir, edge2);
+        float a = Vector3.Dot(edge1, h);
+
+        if (a > -EPSILON && a < EPSILON) return false;
+
+        float f = 1.0f / a;
+        Vector3 s = rayOrigin - v0;
+        float u = f * Vector3.Dot(s, h);
+
+        if (u < 0.0f || u > 1.0f) return false;
+
+        Vector3 q = Vector3.Cross(s, edge1);
+        float v = f * Vector3.Dot(rayDir, q);
+
+        if (v < 0.0f || u + v > 1.0f) return false;
+
+        float t = f * Vector3.Dot(edge2, q);
+        return t > EPSILON;
+    }
+
+    // =========================================================================
+    // HELPER FUNCTIONS: Surface Projection Logic
+    // =========================================================================
+    private static Vector3 GetClosestPointOnMesh(Vector3 point, Vector3[] verts, int[] tris)
+    {
+        float minSqDist = float.MaxValue;
+        Vector3 closestPoint = point;
+
+        for (int i = 0; i < tris.Length; i += 3)
         {
-            var tet = tets[i];
-            float vol = CalculateSignedVolume(vertices[tet.v0], vertices[tet.v1], vertices[tet.v2], vertices[tet.v3]);
-            tet.restVolume = Mathf.Max(vol, 1e-5f);
-            tets[i] = tet;
+            Vector3 p = ClosestPointOnTriangle(point, verts[tris[i]], verts[tris[i + 1]], verts[tris[i + 2]]);
+            float sqDist = (point - p).sqrMagnitude;
+            if (sqDist < minSqDist)
+            {
+                minSqDist = sqDist;
+                closestPoint = p;
+            }
         }
+        return closestPoint;
     }
 
     private static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
@@ -184,7 +221,6 @@ public class TetrahedralMesh
         Vector3 ab = b - a;
         Vector3 ac = c - a;
         Vector3 ap = p - a;
-
         float d1 = Vector3.Dot(ab, ap);
         float d2 = Vector3.Dot(ac, ap);
         if (d1 <= 0.0f && d2 <= 0.0f) return a;
@@ -221,115 +257,114 @@ public class TetrahedralMesh
         }
 
         float denom = 1.0f / (va + vb + vc);
-        float v_in = vb * denom;
-        float w_in = vc * denom;
-        return a + ab * v_in + ac * w_in;
-    }
-
-    public static float CalculateSignedVolume(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3)
-    {
-        return Vector3.Dot(p1 - p0, Vector3.Cross(p2 - p0, p3 - p0)) / 6.0f;
-    }
-
-    private static bool IsPointInsideMesh(Vector3 point, Vector3[] verts, int[] tris)
-    {
-        int hitsX = CountRayIntersections(point, Vector3.right, verts, tris);
-        int hitsY = CountRayIntersections(point, Vector3.up, verts, tris);
-        int hitsZ = CountRayIntersections(point, Vector3.forward, verts, tris);
-
-        int insideVotes = 0;
-        if ((hitsX % 2) == 1) insideVotes++;
-        if ((hitsY % 2) == 1) insideVotes++;
-        if ((hitsZ % 2) == 1) insideVotes++;
-
-        return insideVotes >= 2;
-    }
-
-    private static int CountRayIntersections(Vector3 origin, Vector3 dir, Vector3[] verts, int[] tris)
-    {
-        int count = 0;
-        for (int i = 0; i < tris.Length; i += 3)
-        {
-            if (RayTriangleIntersection(origin, dir, verts[tris[i]], verts[tris[i + 1]], verts[tris[i + 2]]))
-            {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    private static bool RayTriangleIntersection(Vector3 origin, Vector3 dir, Vector3 v0, Vector3 v1, Vector3 v2)
-    {
-        const float EPSILON = 1e-6f;
-        Vector3 edge1 = v1 - v0;
-        Vector3 edge2 = v2 - v0;
-        Vector3 h = Vector3.Cross(dir, edge2);
-        float a = Vector3.Dot(edge1, h);
-
-        if (a > -EPSILON && a < EPSILON) return false;
-
-        float f = 1.0f / a;
-        Vector3 s = origin - v0;
-        float u = f * Vector3.Dot(s, h);
-        if (u < 0.0f || u > 1.0f) return false;
-
-        Vector3 q = Vector3.Cross(s, edge1);
-        float v = f * Vector3.Dot(dir, q);
-        if (v < 0.0f || u + v > 1.0f) return false;
-
-        float t = f * Vector3.Dot(edge2, q);
-        return t > EPSILON;
+        float v_ = vb * denom;
+        float w_ = vc * denom;
+        return a + ab * v_ + ac * w_;
     }
 
     public List<int> ReconstructSurfaceTriangles()
     {
-        Dictionary<(int, int, int), int> faceCounts = new Dictionary<(int, int, int), int>();
-        Dictionary<(int, int, int), (int, int, int)> faceOrientations = new Dictionary<(int, int, int), (int, int, int)>();
+        List<int> surfaceTriangles = new List<int>();
+        if (tets == null || tets.Count == 0) return surfaceTriangles;
 
-        if (tets == null) return new List<int>();
+        Dictionary<TriangleKey, TriangleFace> faceCounts = new Dictionary<TriangleKey, TriangleFace>();
 
-        foreach (var tet in tets)
+        void AddFace(int v0, int v1, int v2)
         {
+            TriangleKey key = new TriangleKey(v0, v1, v2);
+            if (faceCounts.TryGetValue(key, out TriangleFace face))
+            {
+                face.count++;
+            }
+            else
+            {
+                faceCounts[key] = new TriangleFace(v0, v1, v2);
+            }
+        }
+
+        for (int i = 0; i < tets.Count; i++)
+        {
+            var tet = tets[i];
             if (!tet.active) continue;
 
-            (int, int, int)[] faces = new (int, int, int)[]
-            {
-            (tet.v0, tet.v2, tet.v1),
-            (tet.v0, tet.v1, tet.v3),
-            (tet.v0, tet.v3, tet.v2),
-            (tet.v1, tet.v2, tet.v3)
-            };
-
-            foreach (var f in faces)
-            {
-                int[] sorted = new int[] { f.Item1, f.Item2, f.Item3 };
-                System.Array.Sort(sorted);
-                var key = (sorted[0], sorted[1], sorted[2]);
-
-                if (faceCounts.ContainsKey(key))
-                {
-                    faceCounts[key]++;
-                }
-                else
-                {
-                    faceCounts[key] = 1;
-                    faceOrientations[key] = f;
-                }
-            }
+            AddFace(tet.v0, tet.v2, tet.v1);
+            AddFace(tet.v0, tet.v1, tet.v3);
+            AddFace(tet.v0, tet.v3, tet.v2);
+            AddFace(tet.v1, tet.v2, tet.v3);
         }
 
-        List<int> surfaceTris = new List<int>();
-        foreach (var kvp in faceCounts)
+        foreach (var pair in faceCounts.Values)
         {
-            if (kvp.Value == 1)
+            if (pair.count == 1)
             {
-                var f = faceOrientations[kvp.Key];
-                surfaceTris.Add(f.Item1);
-                surfaceTris.Add(f.Item2);
-                surfaceTris.Add(f.Item3);
+                surfaceTriangles.Add(pair.v0);
+                surfaceTriangles.Add(pair.v1);
+                surfaceTriangles.Add(pair.v2);
             }
         }
 
-        return surfaceTris;
+        return surfaceTriangles;
+    }
+
+    private struct TriangleKey
+    {
+        public readonly int a, b, c;
+
+        public TriangleKey(int v0, int v1, int v2)
+        {
+            if (v0 < v1)
+            {
+                if (v0 < v2)
+                {
+                    a = v0;
+                    if (v1 < v2) { b = v1; c = v2; }
+                    else { b = v2; c = v1; }
+                }
+                else { a = v2; b = v0; c = v1; }
+            }
+            else
+            {
+                if (v1 < v2)
+                {
+                    a = v1;
+                    if (v0 < v2) { b = v0; c = v2; }
+                    else { b = v2; c = v0; }
+                }
+                else { a = v2; b = v1; c = v0; }
+            }
+        }
+
+        public override bool Equals(object obj)
+        {
+            if (!(obj is TriangleKey)) return false;
+            TriangleKey other = (TriangleKey)obj;
+            return a == other.a && b == other.b && c == other.c;
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + a;
+                hash = hash * 31 + b;
+                hash = hash * 31 + c;
+                return hash;
+            }
+        }
+    }
+
+    private class TriangleFace
+    {
+        public int v0, v1, v2;
+        public int count;
+
+        public TriangleFace(int v0, int v1, int v2)
+        {
+            this.v0 = v0;
+            this.v1 = v1;
+            this.v2 = v2;
+            this.count = 1;
+        }
     }
 }

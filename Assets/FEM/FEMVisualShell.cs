@@ -1,48 +1,93 @@
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class FEMVisualShell : MonoBehaviour
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GPUTet
+    {
+        public int v0, v1, v2, v3;
+    }
+
     public enum ShellMode
     {
         ProceduralSurface,
         CustomMeshBarycentric
     }
 
+    [Header("Compute Shader Reference")]
+    public ComputeShader skinningComputeShader;
+
     [Header("Shell Configuration")]
     public FEMPhysicsBody physicsBody;
-    public ShellMode shellMode = ShellMode.ProceduralSurface;
+    public ShellMode shellMode = ShellMode.CustomMeshBarycentric;
 
-    [Header("PBR Texture Mapping")]
-    public Vector2 uvScale = new Vector2(1f, 1f);
-    public Vector2 uvOffset = new Vector2(0f, 0f);
-
-    [Header("Custom High-Poly Model (Custom Mesh Mode)")]
+    [Header("Custom High-Poly Model")]
     public Mesh customVisualMesh;
 
     private Mesh shellMesh;
     private MeshFilter meshFilter;
     private bool isInitialized = false;
 
-    // Barycentric Skinning Data
+    // Source Data
     private Vector3[] customSourceVertices;
-    private Vector3[] customSourceNormals;
-    private Vector4[] customSourceTangents;
-    private Vector2[] customSourceUVs;
+    private Vector3[] deformedVertices;
     private int[] customTetIndices;
     private Vector4[] customBaryWeights;
+
+    // GPU Compute Buffers
+    private ComputeBuffer tetBuffer;
+    private ComputeBuffer physPosBuffer;
+    private ComputeBuffer tetIdxBuffer;
+    private ComputeBuffer baryWeightsBuffer;
+    private ComputeBuffer outputVertsBuffer;
+
+    private int kernelCSMain;
 
     private void Awake()
     {
         meshFilter = GetComponent<MeshFilter>();
-        if (physicsBody == null)
-            physicsBody = GetComponentInParent<FEMPhysicsBody>();
+        if (physicsBody == null) physicsBody = GetComponentInParent<FEMPhysicsBody>();
     }
 
     private void Start()
     {
         RebuildShell();
+    }
+
+    private void LateUpdate()
+    {
+        if (!isInitialized || physicsBody == null) return;
+
+        if (shellMode == ShellMode.CustomMeshBarycentric && skinningComputeShader != null && outputVertsBuffer != null && tetBuffer != null && tetBuffer.IsValid())
+        {
+            physPosBuffer.SetData(physicsBody.CurrentPositions);
+            skinningComputeShader.SetBuffer(kernelCSMain, "_PhysPosBuffer", physPosBuffer);
+
+            int threadGroups = Mathf.Max(1, Mathf.CeilToInt(customSourceVertices.Length / 64.0f));
+            skinningComputeShader.Dispatch(kernelCSMain, threadGroups, 1, 1);
+
+            outputVertsBuffer.GetData(deformedVertices);
+
+            // Convert world-space positions to local space to prevent transform offset duplication
+            Vector3[] localVerts = new Vector3[deformedVertices.Length];
+            Matrix4x4 worldToLocal = transform.worldToLocalMatrix;
+            for (int i = 0; i < deformedVertices.Length; i++)
+            {
+                localVerts[i] = worldToLocal.MultiplyPoint3x4(deformedVertices[i]);
+            }
+
+            shellMesh.vertices = localVerts;
+            shellMesh.RecalculateNormals();
+            shellMesh.RecalculateBounds();
+            meshFilter.mesh = shellMesh;
+        }
+        else if (shellMode == ShellMode.ProceduralSurface)
+        {
+            SetupProceduralSurfaceShell();
+        }
     }
 
     public void OnMeshCut()
@@ -53,18 +98,21 @@ public class FEMVisualShell : MonoBehaviour
 
     public void RebuildShell()
     {
+        ReleaseComputeBuffers();
+
         if (physicsBody == null || physicsBody.TetMesh == null || physicsBody.CurrentPositions == null) return;
 
         if (shellMesh == null)
         {
-            shellMesh = new Mesh { name = "FEM_Visual_Shell" };
+            shellMesh = new Mesh { name = "FEM_GPU_Visual_Shell" };
             shellMesh.MarkDynamic();
             if (meshFilter != null) meshFilter.mesh = shellMesh;
         }
 
-        if (shellMode == ShellMode.CustomMeshBarycentric && customVisualMesh != null)
+        if (shellMode == ShellMode.CustomMeshBarycentric && customVisualMesh != null && skinningComputeShader != null)
         {
-            SetupBarycentricSkinning();
+            SetupBarycentricSkinningSpatial();
+            InitializeGPUBuffers();
         }
         else
         {
@@ -74,128 +122,105 @@ public class FEMVisualShell : MonoBehaviour
         isInitialized = true;
     }
 
-    private void SetupProceduralSurfaceShell()
-    {
-        List<int> tris = physicsBody.TetMesh.ReconstructSurfaceTriangles();
-        Vector3[] physPositions = physicsBody.CurrentPositions;
-
-        if (physPositions == null || physPositions.Length == 0) return;
-
-        // Fallback: If no boundary triangles detected, render all tet faces so something is always visible
-        if (tris == null || tris.Count == 0)
-        {
-            Debug.LogWarning("FEMVisualShell: ReconstructSurfaceTriangles returned 0 surface faces. Using all tet faces fallback.");
-            tris = GetAllTetFaces(physicsBody.TetMesh);
-        }
-
-        Vector3[] localVerts = new Vector3[physPositions.Length];
-        for (int i = 0; i < physPositions.Length; i++)
-        {
-            localVerts[i] = transform.InverseTransformPoint(physPositions[i]);
-        }
-
-        shellMesh.Clear();
-        shellMesh.vertices = localVerts;
-        shellMesh.triangles = tris.ToArray();
-        shellMesh.RecalculateNormals();
-
-        Vector3[] normals = shellMesh.normals;
-        Vector2[] uvs = new Vector2[localVerts.Length];
-
-        for (int i = 0; i < localVerts.Length; i++)
-        {
-            Vector3 pos = localVerts[i];
-            Vector3 n = (normals != null && i < normals.Length) ? normals[i] : Vector3.up;
-
-            float absX = Mathf.Abs(n.x);
-            float absY = Mathf.Abs(n.y);
-            float absZ = Mathf.Abs(n.z);
-
-            Vector2 projectedUV;
-            if (absY >= absX && absY >= absZ)
-                projectedUV = new Vector2(pos.x, pos.z);
-            else if (absX >= absY && absX >= absZ)
-                projectedUV = new Vector2(pos.z, pos.y);
-            else
-                projectedUV = new Vector2(pos.x, pos.y);
-
-            uvs[i] = new Vector2(
-                projectedUV.x * uvScale.x + uvOffset.x,
-                projectedUV.y * uvScale.y + uvOffset.y
-            );
-        }
-
-        shellMesh.uv = uvs;
-        shellMesh.RecalculateTangents();
-        shellMesh.RecalculateBounds();
-    }
-
-    private List<int> GetAllTetFaces(TetrahedralMesh tetMesh)
-    {
-        List<int> faces = new List<int>();
-        if (tetMesh == null || tetMesh.tets == null) return faces;
-
-        foreach (var tet in tetMesh.tets)
-        {
-            if (!tet.active) continue;
-            faces.Add(tet.v0); faces.Add(tet.v2); faces.Add(tet.v1);
-            faces.Add(tet.v0); faces.Add(tet.v1); faces.Add(tet.v3);
-            faces.Add(tet.v0); faces.Add(tet.v3); faces.Add(tet.v2);
-            faces.Add(tet.v1); faces.Add(tet.v2); faces.Add(tet.v3);
-        }
-        return faces;
-    }
-
-    private void SetupBarycentricSkinning()
+    private void SetupBarycentricSkinningSpatial()
     {
         var tetMesh = physicsBody.TetMesh;
         if (tetMesh == null || tetMesh.tets.Count == 0) return;
 
         customSourceVertices = customVisualMesh.vertices;
-        customSourceNormals = customVisualMesh.normals;
-        customSourceTangents = customVisualMesh.tangents;
-        customSourceUVs = customVisualMesh.uv;
-
         int numVerts = customSourceVertices.Length;
+
         customTetIndices = new int[numVerts];
         customBaryWeights = new Vector4[numVerts];
 
+        Vector3 currentScale = transform.lossyScale;
+        float maxScaleFactor = Mathf.Max(currentScale.x, Mathf.Max(currentScale.y, currentScale.z));
+        float cellSize = physicsBody.targetTetSize * maxScaleFactor * 2.0f;
+        if (cellSize <= 0.001f) cellSize = 0.2f * maxScaleFactor;
+
+        Dictionary<Vector3Int, List<int>> spatialGrid = new Dictionary<Vector3Int, List<int>>();
+
+        Vector3[] scaledSourceVerts = new Vector3[numVerts];
         for (int i = 0; i < numVerts; i++)
         {
-            int bestTetIdx = 0;
+            scaledSourceVerts[i] = transform.TransformPoint(customSourceVertices[i]);
+        }
+
+        for (int t = 0; t < tetMesh.tets.Count; t++)
+        {
+            var tet = tetMesh.tets[t];
+            if (!tet.active) continue;
+
+            Vector3 center = (physicsBody.CurrentPositions[tet.v0] +
+                              physicsBody.CurrentPositions[tet.v1] +
+                              physicsBody.CurrentPositions[tet.v2] +
+                              physicsBody.CurrentPositions[tet.v3]) * 0.25f;
+
+            Vector3Int cell = GetGridCell(center, cellSize);
+            if (!spatialGrid.TryGetValue(cell, out List<int> list))
+            {
+                list = new List<int>();
+                spatialGrid[cell] = list;
+            }
+            list.Add(t);
+        }
+
+        for (int i = 0; i < numVerts; i++)
+        {
+            Vector3 worldVPos = scaledSourceVerts[i];
+            Vector3Int cell = GetGridCell(worldVPos, cellSize);
+
+            int bestTetIdx = -1;
             Vector4 bestWeights = Vector4.zero;
             float minDistance = float.MaxValue;
 
-            for (int t = 0; t < tetMesh.tets.Count; t++)
+            for (int x = -1; x <= 1; x++)
             {
-                var tet = tetMesh.tets[t];
-                if (!tet.active) continue;
-
-                Vector3 x0 = tetMesh.vertices[tet.v0];
-                Vector3 x1 = tetMesh.vertices[tet.v1];
-                Vector3 x2 = tetMesh.vertices[tet.v2];
-                Vector3 x3 = tetMesh.vertices[tet.v3];
-
-                Matrix3x3 Dm = new Matrix3x3(x1 - x0, x2 - x0, x3 - x0);
-                Matrix3x3 invDm = Dm.Inverse();
-
-                Vector3 diff = customSourceVertices[i] - x0;
-                Vector3 alphaBetaGamma = invDm.MultiplyVector(diff);
-
-                float w1 = alphaBetaGamma.x;
-                float w2 = alphaBetaGamma.y;
-                float w3 = alphaBetaGamma.z;
-                float w0 = 1.0f - (w1 + w2 + w3);
-
-                Vector3 tetCenter = (x0 + x1 + x2 + x3) * 0.25f;
-                float dist = (customSourceVertices[i] - tetCenter).sqrMagnitude;
-
-                if (dist < minDistance)
+                for (int y = -1; y <= 1; y++)
                 {
-                    minDistance = dist;
-                    bestTetIdx = t;
-                    bestWeights = new Vector4(w0, w1, w2, w3);
+                    for (int z = -1; z <= 1; z++)
+                    {
+                        Vector3Int neighborCell = cell + new Vector3Int(x, y, z);
+                        if (!spatialGrid.TryGetValue(neighborCell, out List<int> candidateTets)) continue;
+
+                        foreach (int t in candidateTets)
+                        {
+                            var tet = tetMesh.tets[t];
+
+                            Vector3 x0 = physicsBody.CurrentPositions[tet.v0];
+                            Vector3 x1 = physicsBody.CurrentPositions[tet.v1];
+                            Vector3 x2 = physicsBody.CurrentPositions[tet.v2];
+                            Vector3 x3 = physicsBody.CurrentPositions[tet.v3];
+
+                            Vector3 tetCenter = (x0 + x1 + x2 + x3) * 0.25f;
+                            float dist = (worldVPos - tetCenter).sqrMagnitude;
+
+                            if (dist < minDistance)
+                            {
+                                FEMMatrix3x3 Dm = new FEMMatrix3x3(x1 - x0, x2 - x0, x3 - x0);
+                                FEMMatrix3x3 invDm = Dm.Inverse();
+
+                                Vector3 diff = worldVPos - x0;
+                                Vector3 abg = invDm.MultiplyVector(diff);
+
+                                float w1 = abg.x;
+                                float w2 = abg.y;
+                                float w3 = abg.z;
+                                float w0 = 1.0f - (w1 + w2 + w3);
+
+                                minDistance = dist;
+                                bestTetIdx = t;
+                                bestWeights = new Vector4(w0, w1, w2, w3);
+                            }
+                        }
+                    }
                 }
+            }
+
+            if (bestTetIdx == -1 && tetMesh.tets.Count > 0)
+            {
+                bestTetIdx = 0;
+                bestWeights = new Vector4(0.25f, 0.25f, 0.25f, 0.25f);
             }
 
             customTetIndices[i] = bestTetIdx;
@@ -205,62 +230,86 @@ public class FEMVisualShell : MonoBehaviour
         shellMesh.Clear();
         shellMesh.vertices = new Vector3[numVerts];
         shellMesh.triangles = customVisualMesh.triangles;
-        shellMesh.uv = customSourceUVs;
-        if (customSourceNormals != null && customSourceNormals.Length > 0) shellMesh.normals = customSourceNormals;
-        if (customSourceTangents != null && customSourceTangents.Length > 0) shellMesh.tangents = customSourceTangents;
+        shellMesh.uv = customVisualMesh.uv;
     }
 
-    private void LateUpdate()
+    private void SetupProceduralSurfaceShell()
     {
-        if (!isInitialized || shellMesh == null || shellMesh.triangles.Length == 0)
+        if (physicsBody == null || physicsBody.TetMesh == null) return;
+
+        List<int> surfaceTris = physicsBody.TetMesh.ReconstructSurfaceTriangles();
+        Vector3[] localVerts = new Vector3[physicsBody.CurrentPositions.Length];
+
+        for (int i = 0; i < physicsBody.CurrentPositions.Length; i++)
         {
-            RebuildShell();
-            return;
+            localVerts[i] = transform.InverseTransformPoint(physicsBody.CurrentPositions[i]);
         }
 
-        UpdateShellPositions();
+        shellMesh.Clear();
+        shellMesh.vertices = localVerts;
+        shellMesh.triangles = surfaceTris.ToArray();
+        shellMesh.RecalculateNormals();
+        shellMesh.RecalculateBounds();
+        meshFilter.mesh = shellMesh;
     }
 
-    private void UpdateShellPositions()
+    private void InitializeGPUBuffers()
     {
-        if (physicsBody == null || physicsBody.CurrentPositions == null) return;
+        var tetMesh = physicsBody.TetMesh;
+        if (tetMesh == null || customSourceVertices == null) return;
 
-        Vector3[] physPositions = physicsBody.CurrentPositions;
+        int numVerts = customSourceVertices.Length;
+        int numTets = tetMesh.tets.Count;
 
-        if (shellMode == ShellMode.ProceduralSurface)
+        deformedVertices = new Vector3[numVerts];
+
+        GPUTet[] gpuTets = new GPUTet[numTets];
+        for (int i = 0; i < numTets; i++)
         {
-            Vector3[] localVerts = new Vector3[physPositions.Length];
-            for (int i = 0; i < physPositions.Length; i++)
-            {
-                localVerts[i] = transform.InverseTransformPoint(physPositions[i]);
-            }
-
-            shellMesh.vertices = localVerts;
-            shellMesh.RecalculateNormals();
-            shellMesh.RecalculateBounds();
+            var t = tetMesh.tets[i];
+            gpuTets[i] = new GPUTet { v0 = t.v0, v1 = t.v1, v2 = t.v2, v3 = t.v3 };
         }
-        else if (shellMode == ShellMode.CustomMeshBarycentric && customTetIndices != null)
-        {
-            var tetMesh = physicsBody.TetMesh;
-            Vector3[] deformedVerts = new Vector3[customSourceVertices.Length];
 
-            for (int i = 0; i < customSourceVertices.Length; i++)
-            {
-                var tet = tetMesh.tets[customTetIndices[i]];
-                Vector4 w = customBaryWeights[i];
+        tetBuffer = new ComputeBuffer(numTets, sizeof(int) * 4);
+        tetBuffer.SetData(gpuTets);
 
-                Vector3 p0 = physPositions[tet.v0];
-                Vector3 p1 = physPositions[tet.v1];
-                Vector3 p2 = physPositions[tet.v2];
-                Vector3 p3 = physPositions[tet.v3];
+        physPosBuffer = new ComputeBuffer(physicsBody.CurrentPositions.Length, sizeof(float) * 3);
+        tetIdxBuffer = new ComputeBuffer(numVerts, sizeof(int));
+        baryWeightsBuffer = new ComputeBuffer(numVerts, sizeof(float) * 4);
+        outputVertsBuffer = new ComputeBuffer(numVerts, sizeof(float) * 3);
 
-                Vector3 worldPos = w.x * p0 + w.y * p1 + w.z * p2 + w.w * p3;
-                deformedVerts[i] = transform.InverseTransformPoint(worldPos);
-            }
+        tetIdxBuffer.SetData(customTetIndices);
+        baryWeightsBuffer.SetData(customBaryWeights);
 
-            shellMesh.vertices = deformedVerts;
-            shellMesh.RecalculateNormals();
-            shellMesh.RecalculateBounds();
-        }
+        kernelCSMain = skinningComputeShader.FindKernel("CSMain");
+
+        // Updated buffer names to match HLSL property names
+        skinningComputeShader.SetBuffer(kernelCSMain, "_TetBuffer", tetBuffer);
+        skinningComputeShader.SetBuffer(kernelCSMain, "_PhysPosBuffer", physPosBuffer);
+        skinningComputeShader.SetBuffer(kernelCSMain, "_CustomTetIndices", tetIdxBuffer);
+        skinningComputeShader.SetBuffer(kernelCSMain, "_CustomBaryWeights", baryWeightsBuffer);
+        skinningComputeShader.SetBuffer(kernelCSMain, "_DeformedVertices", outputVertsBuffer);
+        skinningComputeShader.SetInt("numVertices", numVerts);
     }
+
+    private Vector3Int GetGridCell(Vector3 pos, float cellSize)
+    {
+        return new Vector3Int(
+            Mathf.FloorToInt(pos.x / cellSize),
+            Mathf.FloorToInt(pos.y / cellSize),
+            Mathf.FloorToInt(pos.z / cellSize)
+        );
+    }
+
+    private void ReleaseComputeBuffers()
+    {
+        tetBuffer?.Release();
+        physPosBuffer?.Release();
+        tetIdxBuffer?.Release();
+        baryWeightsBuffer?.Release();
+        outputVertsBuffer?.Release();
+    }
+
+    private void OnDisable() => ReleaseComputeBuffers();
+    private void OnDestroy() => ReleaseComputeBuffers();
 }
